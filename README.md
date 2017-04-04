@@ -18,6 +18,7 @@ You can join the discussion on Weld on our [Google Group](https://groups.google.
   * [Grizzly (Pandas on Weld)](#grizzly)
   * [Running an Interactive REPL](#running-an-interactive-repl)
   * [Benchmarking](#benchmarking)
+  * [Spatial](#spatial)
 
 ## Building
 
@@ -144,4 +145,75 @@ $ cargo bench [benchmark-name]
 ```
 
 If a benchmark name is not provided, all benchmarks are run.
+
+## Spatial
+
+This branch contains preliminary support for generating [Spatial](https://github.com/stanford-ppl/spatial-lang)
+code from Weld.  To see it in action, run `repl --spatial` and enter Weld expressions as usual.
+The Spatial code generator will spit out Spatial code if it understands the expression.
+
+Example Spatial `repl` session:
+```
+>> |v: vec[i64]| result(for(v, merger[i64,+], |b, i, e| merge(b, e)))
+[...]
+
+Spatial code:
+@virtualize
+def spatialProg(param_v_0: Array[Int]) = {
+  val tmp_0 = ArgIn[Int]
+  setArg(tmp_0, param_v_0.length)
+  val v_0 = DRAM[Int](tmp_0)
+  setMem(v_0, param_v_0)
+  val out = ArgOut[Int]
+  Accel {
+    val tmp_1 = Reg[Int]
+    assert((tmp_0+0) % 16 == 0)
+    Reduce(tmp_1)(tmp_0 by 16){ i =>
+      val tmp_2 = SRAM[Int](16)
+      tmp_2 load v_0(i::i+16)
+      Reduce(Reg[Int])(16 by 1){ ii =>
+        val i_0 = i*16 + ii
+        val e_0 = tmp_2(ii)
+        e_0
+      }{ _+_ }
+    }{ _+_ }
+    val tmp_3 = tmp_1.value
+    out := tmp_3
+  }
+  getArg(out)
+}
+```
+
+To run the Spatial code above, you need a `main` function to call `spatialProg` with an array,
+along with other boilerplate.  Here is an example:
+```scala
+import spatial._
+import org.virtualized._
+
+object Foo extends SpatialApp {
+  import IR._
+
+  @virtualize
+  def spatialProg(param_v_0: Array[Int]) = {
+    // [Insert Spatial code from above]
+  }
+
+  @virtualize
+  def main() {
+    // Generate an array of 160 integers.
+    val N = 160
+    val a = Array.tabulate(N){ i => i % 256 }
+
+    val result = spatialProg(a)
+    println("result: " + result)
+  }
+}
+```
+
+The [Spatial tutorial](http://spatial-lang.readthedocs.io/en/latest/tutorial.html) has
+detailed instructions on setting up Spatial and running Spatial code.
+
+If the Spatial backend doesn't understand the expression entered in the REPL, it will
+generate an error message.  See [spatial.rs](weld/spatial.rs) for all patterns understood by the
+Spatial backend.
 
