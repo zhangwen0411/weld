@@ -10,16 +10,21 @@ use super::util::SymbolGenerator;
 
 pub struct SpatialProgram {
     pub code: CodeBuilder,
-    veclen_sym: HashMap<Symbol, Symbol>,
     sym_gen: SymbolGenerator,
+
+    // Context for compilation.
+    veclen_sym: HashMap<Symbol, Symbol>, // symbol for vector => symbol for vector length
+    pub merger_binop: HashMap<Symbol, BinOpKind>, // reg symbol for merger => binop
 }
 
 impl SpatialProgram {
     pub fn new(weld_ast: &TypedExpr) -> SpatialProgram {
         let prog = SpatialProgram {
             code: CodeBuilder::new(),
-            veclen_sym: HashMap::new(),
             sym_gen: SymbolGenerator::from_expression(weld_ast),
+
+            veclen_sym: HashMap::new(),
+            merger_binop: HashMap::new(),
         };
         prog
     }
@@ -170,14 +175,22 @@ fn gen_scalar_type(ty: &Type, err_msg: String) -> WeldResult<String> {
     }
 }
 
-fn gen_expr(expr: &TypedExpr, prog: &mut SpatialProgram)
-            -> WeldResult<Symbol> {
+fn gen_expr(expr: &TypedExpr, prog: &mut SpatialProgram) -> WeldResult<Symbol> {
     match expr.kind {
         ExprKind::Ident(ref sym) => Ok(sym.clone()),
 
         ExprKind::Literal(lit) => {
             let res_sym = prog.add_variable();
             prog.code.add(format!("val {} = {}", gen_sym(&res_sym), gen_lit(lit)));
+            Ok(res_sym)
+        }
+
+        ExprKind::BinOp { kind, ref left, ref right } => {
+            let left_sym = gen_expr(left, prog)?;
+            let right_sym = gen_expr(right, prog)?;
+            let res_sym = prog.add_variable();
+            prog.code.add(format!("val {} = {} {} {}", gen_sym(&res_sym), gen_sym(&left_sym),
+                                  kind, gen_sym(&right_sym)));
             Ok(res_sym)
         }
 
@@ -193,107 +206,106 @@ fn gen_expr(expr: &TypedExpr, prog: &mut SpatialProgram)
             let data_res = gen_expr(&iter.data, prog)?;
 
             // builder
-            match builder.ty {
-                Type::Builder(ref builder_kind) => {
-                    match *builder_kind {
-                        BuilderKind::Merger(ref boxed_builder_ty, binop_kind) => {
-                            let builder_res = gen_expr(builder, prog)?;
+            let builder_sym = gen_expr(builder, prog)?;
+            let builder_kind = match builder.ty {
+                Type::Builder(ref kind) => kind,
+                _ => weld_err!("Builder is not a builder: {}", print_expr(builder))?,
+            };
 
-                            if let ExprKind::Lambda { ref params, ref body } = func.kind {
-                                let ref b_sym = params[0].name;
-                                let ref i_sym = params[1].name;
-                                let ref e_sym = params[2].name;
+            // func
+            if let ExprKind::Lambda { ref params, ref body } = func.kind {
+                let ref b_sym = params[0].name;
+                let ref i_sym = params[1].name;
+                let ref e_sym = params[2].name;
 
-                                if let ExprKind::Merge { ref builder, ref value } = body.kind {
-                                    const BLK_SIZE: i32 = 16;
-                                    // TODO(zhangwen): currently must divide vector size evenly.
-                                    let veclen_sym = prog.get_veclen_sym(&data_res);
-                                    // The % operator doesn't work on registers; the `+0` is a hack
-                                    // to make it work.
-                                    prog.code.add(format!("assert(({}+0) % {} == 0)",
-                                                          gen_sym(&veclen_sym),
-                                                          BLK_SIZE));
+                match *builder_kind {
+                    BuilderKind::Merger(ref elem_ty, binop_kind) => {
+                        const BLK_SIZE: i32 = 16; // TODO(zhangwen): tunable parameter.
+                        // TODO(zhangwen): currently must divide vector size evenly.
+                        let veclen_sym = prog.get_veclen_sym(&data_res);
+                        // The % operator doesn't work on registers; the `+0` is a hack
+                        // to make it work.
+                        prog.code.add(format!("assert(({}+0) % {} == 0)",
+                                              gen_sym(&veclen_sym),
+                                              BLK_SIZE));
 
-                                    prog.code.add(format!(
-                                            "Reduce({acc})({size} by {blk_size}){{ i =>",
-                                            acc=gen_sym(&builder_res),
-                                            size=gen_sym(&veclen_sym),
-                                            blk_size=BLK_SIZE,
-                                    ));
+                        prog.code.add(format!(
+                                "Reduce({acc})({size} by {blk_size}){{ i =>",
+                                acc=gen_sym(&builder_sym),
+                                size=gen_sym(&veclen_sym),
+                                blk_size=BLK_SIZE,
+                        ));
 
-                                    // Tiling: bring BLK_SIZE elements into SRAM.
-                                    let merger_type_scala = gen_scalar_type(boxed_builder_ty,format!(
-                                            "Not supported merger type: {}",
-                                            print_type(boxed_builder_ty as &Type)))?;
-                                    let sram_sym = prog.add_variable();
-                                    prog.code.add(format!("val {} = SRAM[{}]({})",
-                                                          gen_sym(&sram_sym),
-                                                          merger_type_scala,
-                                                          BLK_SIZE));
-                                    prog.code.add(format!("{} load {}(i::i+{})",
-                                                          gen_sym(&sram_sym),
-                                                          gen_sym(&data_res),
-                                                          BLK_SIZE));
-                                    prog.code.add(format!("Reduce(Reg[{}])({} by 1){{ ii =>",
-                                                          merger_type_scala,
-                                                          BLK_SIZE));
+                        // Tiling: bring BLK_SIZE elements into SRAM.
+                        let merger_type_scala = gen_scalar_type(elem_ty, format!(
+                                "Not supported merger elem type: {}",
+                                print_type(elem_ty as &Type)))?;
+                        let sram_sym = prog.add_variable();
+                        prog.code.add(format!("val {} = SRAM[{}]({})",
+                                              gen_sym(&sram_sym),
+                                              merger_type_scala,
+                                              BLK_SIZE));
+                        prog.code.add(format!("{} load {}(i::i+{})",
+                                              gen_sym(&sram_sym),
+                                              gen_sym(&data_res),
+                                              BLK_SIZE));
+                        prog.code.add(format!("Reduce(Reg[{}])({} by 1){{ ii =>",
+                                              merger_type_scala,
+                                              BLK_SIZE));
 
-                                    prog.code.add(format!("val {} = i*{} + ii",
-                                                          gen_sym(i_sym), BLK_SIZE));
-                                    prog.code.add(format!("val {} = {}(ii)",
-                                                          gen_sym(e_sym),
-                                                          gen_sym(&sram_sym)));
+                        prog.code.add(format!("val {} = i + ii", gen_sym(i_sym)));
+                        prog.code.add(format!("val {} = {}(ii)",
+                                              gen_sym(e_sym),
+                                              gen_sym(&sram_sym)));
 
-                                    let func_builder_sym = gen_expr(builder, prog)?;
-                                    if func_builder_sym != *b_sym {
-                                        weld_err!(
-                                            "Not merging into designated builder: {}",
-                                            print_expr(&expr))?;
-                                    }
-                                    let reduce_res = gen_expr(value, prog)?;
-                                    prog.code.add(gen_sym(&reduce_res));
-                                    prog.code.add(format!("}}{{ _{}_ }}", binop_kind)); // Reduce
+                        // All merges to `b` in the function body aggregated into a local
+                        // register before being merged into the final builder.
+                        // TODO(zhangwen): having a local Reg[] seems inefficient.
+                        gen_new_merger(elem_ty, binop_kind, prog, Some(b_sym))?;
 
-                                    prog.code.add(format!("}}{{ _{}_ }}", binop_kind)); // Reduce
-                                    Ok(builder_res)
-                                } else {
-                                    weld_err!("Not supported: For body not a merge")
-                                }
-                            } else {
-                                weld_err!("Argument to For was not a Lambda: {}", print_expr(func))
-                            }
+                        let body_res = gen_expr(body, prog)?;
+                        // We currently require that the body return the same builder `b`.
+                        if body_res != *b_sym {
+                            weld_err!("Not merging into designated builder: {}",
+                                      print_expr(&body))?;
                         }
 
-                        _ => weld_err!("Not supported: {}", print_expr(builder))
-                    }
-                }
+                        // Return the value of `b`.
+                        prog.code.add(format!("{}.value", gen_sym(&b_sym)));
+                        prog.code.add(format!("}}{{ _{}_ }}", binop_kind)); // Reduce
 
-                _ => weld_err!("Argument to For was not a Builder: {}", print_expr(builder))
+                        prog.code.add(format!("}}{{ _{}_ }}", binop_kind)); // Reduce
+                        Ok(builder_sym)
+                    }
+
+                    _ => weld_err!("Builder kind not supported: {}", print_expr(builder))
+                }
+            } else {
+                weld_err!("Argument to For was not a Lambda: {}", print_expr(func))
             }
         }
 
         ExprKind::NewBuilder(_) => {
-            match expr.ty {
-                Type::Builder(ref builder_kind) => {
-                    match *builder_kind {
-                        BuilderKind::Merger(ref boxed_builder_ty, _) => {
-                            let elem_type_scala =
-                                gen_scalar_type(boxed_builder_ty, format!(
-                                        "Not supported merger type: {}",
-                                        print_type(boxed_builder_ty as &Type)))?;
-                            let reg_sym = prog.add_variable();
-                            prog.code.add(format!("val {} = Reg[{}]",
-                                                  gen_sym(&reg_sym),
-                                                  elem_type_scala));
-                            Ok(reg_sym)
-                        }
+            if let Type::Builder(ref kind) = expr.ty {
+                match *kind {
+                    BuilderKind::Merger(ref elem_ty, binop_kind) =>
+                        gen_new_merger(elem_ty, binop_kind, prog, None),
 
-                        _ => weld_err!("Not supported: {}", print_expr(&expr))
-                    }
+                    _ => weld_err!("Builder kind not supported: {}", print_expr(expr))
                 }
-
-                _ => weld_err!("Builder is not a builder: {}", print_expr(&expr))
+            } else {
+                weld_err!("NewBuilder doesn't produce a builder: {}", print_expr(expr))
             }
+        }
+
+        ExprKind::Merge { ref builder, ref value } => {
+            let builder_sym = gen_expr(builder, prog)?;
+            let value_res = gen_expr(value, prog)?;
+            prog.code.add(format!("{builder} := {builder} {op} {value}",
+                                  builder=gen_sym(&builder_sym),
+                                  op=prog.merger_binop.get(&builder_sym).unwrap(),
+                                  value=gen_sym(&value_res)));
+            Ok(builder_sym)
         }
 
         ExprKind::Res { ref builder } => {
@@ -315,6 +327,17 @@ fn gen_expr(expr: &TypedExpr, prog: &mut SpatialProgram)
             weld_err!("Not supported: {}", print_expr(&expr))
         }
     }
+}
+
+fn gen_new_merger(elem_ty: &Type, binop_kind: BinOpKind,
+                  prog: &mut SpatialProgram, reg_sym: Option<&Symbol>)
+                  -> WeldResult<Symbol> {
+    let elem_type_scala = gen_scalar_type(elem_ty, format!("Not supported merger type: {}",
+                                                           print_type(elem_ty)))?;
+    let reg_sym = reg_sym.map_or_else(|| prog.add_variable(), Symbol::clone);
+    prog.code.add(format!("val {} = Reg[{}]", gen_sym(&reg_sym), elem_type_scala));
+    prog.merger_binop.insert(reg_sym.clone(), binop_kind);
+    Ok(reg_sym)
 }
 
 fn gen_lit(lit: LiteralKind) -> String {
