@@ -172,7 +172,7 @@ def spatialProg(param_v_0: Array[Int]) = {
       val tmp_2 = SRAM[Int](16)
       tmp_2 load v_0(i::i+16)
       Reduce(Reg[Int])(16 by 1){ ii =>
-        val i_0 = i*16 + ii
+        val i_0 = i + ii
         val e_0 = tmp_2(ii)
         e_0
       }{ _+_ }
