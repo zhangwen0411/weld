@@ -166,19 +166,21 @@ def spatialProg(param_v_0: Array[Int]) = {
   setMem(v_0, param_v_0)
   val out = ArgOut[Int]
   Accel {
-    val tmp_1 = Reg[Int]
+    val tmp_1 : Int = 0
     assert((tmp_0+0) % 16 == 0)
-    Reduce(tmp_1)(tmp_0 by 16){ i =>
-      val tmp_2 = SRAM[Int](16)
-      tmp_2 load v_0(i::i+16)
+    val tmp_2 = Reduce(Reg[Int])(tmp_0 by 16){ i =>
+      val tmp_3 = SRAM[Int](16)
+      tmp_3 load v_0(i::i+16)
       Reduce(Reg[Int])(16 by 1){ ii =>
         val i_0 = i + ii
-        val e_0 = tmp_2(ii)
-        e_0
+        val e_0 = tmp_3(ii)
+        val b_0 : Int = 0
+        val tmp_4 = b_0 + e_0
+        tmp_4
       }{ _+_ }
     }{ _+_ }
-    val tmp_3 = tmp_1.value
-    out := tmp_3
+    val tmp_5 = tmp_1 + tmp_2
+    out := tmp_5
   }
   getArg(out)
 }
