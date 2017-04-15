@@ -47,6 +47,21 @@ impl LocalCtx {
         }
     }
 
+    /// Merges two local contexts into self based on condition.
+    pub fn merge(&mut self, cond_sym: &Symbol,
+                 true_local_ctx: &LocalCtx, false_local_ctx: &LocalCtx,
+                 glob_ctx: &mut GlobalCtx) {
+        // Ignore `veclen_sym` since vectors lengths don't change.
+
+        // `merger_env`
+        for (merger_sym, state) in self.merger_env.iter_mut() {
+            // `merger_sym` should exist in both sub-contexts.
+            let on_true_val_sym = true_local_ctx.get_merger_val(&merger_sym);
+            let on_false_val_sym = false_local_ctx.get_merger_val(&merger_sym);
+            state.value = gen_mux(cond_sym, &on_true_val_sym, &on_false_val_sym, glob_ctx);
+        }
+    }
+
     pub fn get_veclen_sym(&mut self, vec: &Symbol, glob_ctx: &mut GlobalCtx) -> Symbol {
         let res = self.veclen_sym.get(vec).map(Symbol::clone);
         match res {
@@ -161,7 +176,7 @@ fn gen_spatial_input_param_setup(param: &Parameter<Type>,
             let elem_type_scala = gen_scalar_type(boxed_ty, err_msg)?;
 
             let veclen_sym_name = gen_sym(&local_ctx.get_veclen_sym(&param.name, glob_ctx));
-            glob_ctx.code.add(format!("val {} = ArgIn[Int]", veclen_sym_name));
+            glob_ctx.code.add(format!("val {} = ArgIn[Index]", veclen_sym_name));
             glob_ctx.code.add(format!("setArg({}, {}.length)",
                                       veclen_sym_name, scala_param_name));
             glob_ctx.code.add(format!("val {} = DRAM[{}]({})",
@@ -196,11 +211,11 @@ fn gen_spatial_output_setup(ty: &Type)
 fn gen_scalar_type_from_kind(scalar_kind: ScalarKind) -> String {
     String::from(match scalar_kind {
         ScalarKind::Bool => "Boolean",
-        ScalarKind::I8 => "Int", // TODO(zhangwen): other kinds of int?
+        ScalarKind::I8 => "Char",
         ScalarKind::I32 => "Int",
-        ScalarKind::I64 => "Int", // TODO(zhangwen): how long is Int anyway?
+        ScalarKind::I64 => "Long",
         ScalarKind::F32 => "Float",
-        ScalarKind::F64 => "Float", // TODO(zhangwen): how long is Float?
+        ScalarKind::F64 => "Double",
     })
 }
 
@@ -228,6 +243,25 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
             let res_sym = glob_ctx.add_variable();
             glob_ctx.code.add(format!("val {} = {} {} {}", gen_sym(&res_sym),
                                       gen_sym(&left_sym), kind, gen_sym(&right_sym)));
+            Ok(res_sym)
+        }
+
+        ExprKind::Negate(ref sub_expr) => {
+            let sub_expr_sym = gen_expr(sub_expr, glob_ctx, local_ctx)?;
+            let res_sym = glob_ctx.add_variable();
+            glob_ctx.code.add(format!("val {} = -{}", gen_sym(&res_sym), gen_sym(&sub_expr_sym)));
+            Ok(res_sym)
+        }
+
+        ExprKind::If { ref cond, ref on_true, ref on_false } => {
+            let cond_sym = gen_expr(cond, glob_ctx, local_ctx)?;
+            let mut true_local_ctx = local_ctx.clone();
+            let on_true_sym = gen_expr(on_true, glob_ctx, &mut true_local_ctx)?;
+            let mut false_local_ctx = local_ctx.clone();
+            let on_false_sym = gen_expr(on_false, glob_ctx, &mut false_local_ctx)?;
+
+            local_ctx.merge(&cond_sym, &true_local_ctx, &false_local_ctx, glob_ctx);
+            let res_sym = gen_mux(&cond_sym, &on_true_sym, &on_false_sym, glob_ctx);
             Ok(res_sym)
         }
 
@@ -404,15 +438,32 @@ fn gen_new_merger(elem_ty: &Type, binop: BinOpKind,
     Ok(init_sym)
 }
 
-fn gen_lit(lit: LiteralKind) -> String {
-    match lit {
-        LiteralKind::BoolLiteral(b) => b.to_string(),
-        LiteralKind::I8Literal(i) => i.to_string(),
-        LiteralKind::I32Literal(i) => i.to_string(),
-        LiteralKind::I64Literal(i) => i.to_string(),
-        LiteralKind::F32Literal(f) => f.to_string(),  // TODO(zhangwen): does this work in Scala?
-        LiteralKind::F64Literal(f) => f.to_string(),
+/// Returns a symbol whose value is `cond_sym ? on_true_sym : on_false_sym`.
+fn gen_mux(cond_sym: &Symbol, on_true_sym: &Symbol, on_false_sym: &Symbol,
+           glob_ctx: &mut GlobalCtx) -> Symbol {
+    if on_true_sym == on_false_sym {  // No need for mux (since no side effects).
+        on_true_sym.clone()
+    } else {
+        let res_sym = glob_ctx.add_variable();
+        glob_ctx.code.add(format!("val {} = mux({}, {}, {})",
+                                  gen_sym(&res_sym),
+                                  gen_sym(&cond_sym),
+                                  gen_sym(&on_true_sym),
+                                  gen_sym(&on_false_sym)));
+        res_sym
     }
+}
+
+fn gen_lit(lit: LiteralKind) -> String {
+    let (val_str, type_str) = match lit {
+        LiteralKind::BoolLiteral(b) => (b.to_string(), "Boolean"),
+        LiteralKind::I8Literal(i) => (i.to_string(), "Char"),
+        LiteralKind::I32Literal(i) => (i.to_string(), "Int"),
+        LiteralKind::I64Literal(i) => (i.to_string(), "Long"),
+        LiteralKind::F32Literal(f) => (f.to_string(), "Float"),  // TODO(zhangwen): this works?
+        LiteralKind::F64Literal(f) => (f.to_string(), "Double"),
+    };
+    format!("{}.as[{}]", val_str, type_str)
 }
 
 fn gen_sym(sym: &Symbol) -> String {
