@@ -149,8 +149,11 @@ If a benchmark name is not provided, all benchmarks are run.
 ## Spatial
 
 This branch contains preliminary support for generating [Spatial](https://github.com/stanford-ppl/spatial-lang)
-code from Weld.  To see it in action, run `repl --spatial` and enter Weld expressions as usual.
-The Spatial code generator will spit out Spatial code if it understands the expression.
+code from Weld.  Check out [examples/spatial](examples/spatial) for example Spatial code generated
+from Weld.
+
+To see Spatial code generation in action, run `repl --spatial` and enter Weld expressions as
+usual.  The Spatial code generator will spit out Spatial code if it understands the expression.
 
 Example Spatial `repl` session:
 ```

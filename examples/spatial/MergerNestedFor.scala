@@ -1,0 +1,68 @@
+import spatial._
+import org.virtualized._
+
+object MergerNestedFor extends SpatialApp {
+  import IR._
+
+  // |x: vec[i32], y: vec[i32]| result(for(x, merger[i32, +], |b1, i1, e1|
+  //   for(y, b1, |b2, i2, e2| merge(b2, e1*e2))))
+  @virtualize
+  def spatialProg(param_x_0: Array[Int], param_y_0: Array[Int]) = {
+    val tmp_0 = ArgIn[Int]
+    setArg(tmp_0, param_x_0.length)
+    val x_0 = DRAM[Int](tmp_0)
+    setMem(x_0, param_x_0)
+    val tmp_1 = ArgIn[Int]
+    setArg(tmp_1, param_y_0.length)
+    val y_0 = DRAM[Int](tmp_1)
+    setMem(y_0, param_y_0)
+    val out = ArgOut[Int]
+    Accel {
+      val tmp_2 : Int = 0
+      assert((tmp_0+0) % 16 == 0)
+      val tmp_3 = Reduce(Reg[Int])(tmp_0 by 16){ i =>
+        val tmp_4 = SRAM[Int](16)
+        tmp_4 load x_0(i::i+16)
+        Reduce(Reg[Int])(16 by 1){ ii =>
+          val i1_0 = i + ii
+          val e1_0 = tmp_4(ii)
+          val b1_0 : Int = 0
+          assert((tmp_1+0) % 16 == 0)
+          val tmp_5 = Reduce(Reg[Int])(tmp_1 by 16){ i =>
+            val tmp_6 = SRAM[Int](16)
+            tmp_6 load y_0(i::i+16)
+            Reduce(Reg[Int])(16 by 1){ ii =>
+              val i2_0 = i + ii
+              val e2_0 = tmp_6(ii)
+              val b2_0 : Int = 0
+              val tmp_7 = e1_0 * e2_0
+              val tmp_8 = b2_0 + tmp_7
+              tmp_8
+            }{ _+_ }
+          }{ _+_ }
+          val tmp_9 = b1_0 + tmp_5
+          tmp_9
+        }{ _+_ }
+      }{ _+_ }
+      val tmp_10 = tmp_2 + tmp_3
+      out := tmp_10
+    }
+    getArg(out)
+  }
+
+  @virtualize
+  def main() {
+    val Nx = 1600
+    val x = Array.tabulate(Nx){ i => i % 97 }
+    val Ny = 3200
+    val y = Array.tabulate(Ny){ i => i % 111 }
+
+    val result = spatialProg(x, y)
+    println("result: " + result)
+
+    val gold = x.reduce{_+_} * y.reduce{_+_}
+    println("gold: " + gold)
+    val cksum = gold == result
+    println("PASS: " + cksum + " (MergerNestedFor)")
+  }
+}
