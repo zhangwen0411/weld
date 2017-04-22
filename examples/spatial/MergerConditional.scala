@@ -13,15 +13,15 @@ object MergerConditional extends SpatialApp {
     setMem(v_0, param_v_0)
     val out = ArgOut[Int]
     Accel {
-      val tmp_1 : Int = 0
+      val tmp_1 = 0.to[Int]
       assert((tmp_0+0) % 16 == 0)
       val tmp_2 = Reduce(Reg[Int])(tmp_0 by 16){ i =>
         val tmp_3 = SRAM[Int](16)
         tmp_3 load v_0(i::i+16)
         Reduce(Reg[Int])(16 by 1){ ii =>
-          val i_0 = i + ii
+          val i_0 = (i + ii).to[Long]
           val e_0 = tmp_3(ii)
-          val b_0 : Int = 0
+          val b_0 = 0.to[Int]
           val tmp_4 = 0.to[Int]
           val tmp_5 = e_0 > tmp_4
           val tmp_6 = b_0 + e_0
@@ -30,9 +30,8 @@ object MergerConditional extends SpatialApp {
           val tmp_9 = mux(tmp_5, tmp_6, tmp_8)
           tmp_9
         }{ _+_ }
-      }{ _+_ }
-      val tmp_10 = tmp_1 + tmp_2
-      out := tmp_10
+      }{ _+_ } + tmp_1
+      out := tmp_2
     }
     getArg(out)
   }

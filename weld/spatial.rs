@@ -1,7 +1,6 @@
 //! Emits Spatial code for Weld AST.
 
 use std::collections::HashMap;
-use std::mem;
 
 use super::ast::*;
 use super::code_builder::CodeBuilder;
@@ -36,29 +35,12 @@ struct MergerState {
 #[derive(Clone)]
 struct LocalCtx {
     veclen_sym: HashMap<Symbol, Symbol>, // symbol for vector => symbol for vector length
-    merger_env: HashMap<Symbol, MergerState>, // merger identifier symbol => state
 }
 
 impl LocalCtx {
     pub fn new() -> LocalCtx {
         LocalCtx {
             veclen_sym: HashMap::new(),
-            merger_env: HashMap::new(),
-        }
-    }
-
-    /// Merges two local contexts into self based on condition.
-    pub fn merge(&mut self, cond_sym: &Symbol,
-                 true_local_ctx: &LocalCtx, false_local_ctx: &LocalCtx,
-                 glob_ctx: &mut GlobalCtx) {
-        // Ignore `veclen_sym` since vectors lengths don't change.
-
-        // `merger_env`
-        for (merger_sym, state) in self.merger_env.iter_mut() {
-            // `merger_sym` should exist in both sub-contexts.
-            let on_true_val_sym = true_local_ctx.get_merger_val(&merger_sym);
-            let on_false_val_sym = false_local_ctx.get_merger_val(&merger_sym);
-            state.value = gen_mux(cond_sym, &on_true_val_sym, &on_false_val_sym, glob_ctx);
         }
     }
 
@@ -72,26 +54,6 @@ impl LocalCtx {
                 len_sym
             }
         }
-    }
-
-    /// `merger_sym` also contains the initial value.
-    pub fn new_merger(&mut self, merger_sym: Symbol, binop: BinOpKind) {
-        self.merger_env.insert(merger_sym.clone(),
-                               MergerState { value: merger_sym, binop: binop });
-    }
-
-    pub fn get_merger_state(&self, merger_sym: &Symbol) -> &MergerState {
-        self.merger_env.get(merger_sym).unwrap()
-    }
-
-    pub fn get_merger_val(&self, merger_sym: &Symbol) -> Symbol {
-        self.get_merger_state(merger_sym).value.clone()
-    }
-
-    /// Returns symbol for old value.
-    pub fn update_merger_val(&mut self, merger_sym: &Symbol, new_val: Symbol) -> Symbol {
-        let state = self.merger_env.get_mut(&merger_sym).unwrap();
-        mem::replace(&mut state.value, new_val)
     }
 }
 
@@ -260,7 +222,6 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
             let mut false_local_ctx = local_ctx.clone();
             let on_false_sym = gen_expr(on_false, glob_ctx, &mut false_local_ctx)?;
 
-            local_ctx.merge(&cond_sym, &true_local_ctx, &false_local_ctx, glob_ctx);
             let res_sym = gen_mux(&cond_sym, &on_true_sym, &on_false_sym, glob_ctx);
             Ok(res_sym)
         }
@@ -304,12 +265,13 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                         let merger_type_scala = gen_scalar_type(elem_ty, format!(
                                 "Not supported merger elem type: {}",
                                 print_type(elem_ty as &Type)))?;
+                        // TODO(zhangwen): couldn't get Fold to work in Spatial.
                         glob_ctx.code.add(
                             format!(
                                 "val {reduce_res} = \
                                     Reduce(Reg[{elem_ty}])({size} by {blk_size}){{ i =>",
-                                reduce_res=gen_sym(&reduce_res),
                                 elem_ty=merger_type_scala,
+                                reduce_res=gen_sym(&reduce_res),
                                 size=gen_sym(&veclen_sym),
                                 blk_size=BLK_SIZE,
                         ));
@@ -336,24 +298,17 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                         // Entering a new scope.
                         let mut sub_local_ctx = local_ctx.clone();
                         // Create new merger for `b`; all local merges are gathered into it.
-                        gen_new_merger(elem_ty, binop_kind, glob_ctx,
-                                       &mut sub_local_ctx, Some(b_sym))?;
+                        gen_new_merger(elem_ty, glob_ctx, Some(b_sym))?;
 
                         let body_res = gen_expr(body, glob_ctx, &mut sub_local_ctx)?;
-                        // We currently require that the body return the same builder `b`.
-                        if body_res != *b_sym {
-                            weld_err!("Not merging into designated builder: {}",
-                                      print_expr(&body))?;
-                        }
-
-                        // Return the value of `b`.
-                        glob_ctx.code.add(gen_sym(&sub_local_ctx.get_merger_val(&body_res)));
+                        glob_ctx.code.add(gen_sym(&body_res));
                         glob_ctx.code.add(format!("}}{{ _{}_ }}", binop_kind)); // Reduce
                         // Exiting scope.
 
-                        glob_ctx.code.add(format!("}}{{ _{}_ }}", binop_kind)); // Reduce
-                        gen_merge(&builder_sym, &reduce_res, glob_ctx, local_ctx);
-                        Ok(builder_sym)
+                        glob_ctx.code.add(format!("}}{{ _{binop}_ }} {binop} {old_value}",
+                                                  binop=binop_kind,
+                                                  old_value=gen_sym(&builder_sym))); // Reduce
+                        Ok(reduce_res)
                     }
 
                     _ => weld_err!("Builder kind not supported: {}", print_expr(builder))
@@ -366,8 +321,8 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
         ExprKind::NewBuilder(_) => {
             if let Type::Builder(ref kind) = expr.ty {
                 match *kind {
-                    BuilderKind::Merger(ref elem_ty, binop_kind) =>
-                        gen_new_merger(elem_ty, binop_kind, glob_ctx, local_ctx, None),
+                    BuilderKind::Merger(ref elem_ty, _) =>
+                        gen_new_merger(elem_ty, glob_ctx, None),
 
                     _ => weld_err!("Builder kind not supported: {}", print_expr(expr))
                 }
@@ -382,9 +337,14 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
 
             if let Type::Builder(ref kind) = builder.ty {
                 match *kind {
-                    BuilderKind::Merger(_, _) => {
-                        gen_merge(&builder_sym, &value_res, glob_ctx, local_ctx);
-                        Ok(builder_sym)
+                    BuilderKind::Merger(_, binop) => {
+                        let res_sym = glob_ctx.add_variable();
+                        glob_ctx.code.add(format!("val {new_val} = {old_val} {op} {value}",
+                              new_val=gen_sym(&res_sym),
+                              old_val=gen_sym(&builder_sym),
+                              op=binop,
+                              value=gen_sym(&value_res)));
+                        Ok(res_sym)
                     }
 
                     _ => weld_err!("Builder kind not supported: {}", print_expr(builder))
@@ -398,7 +358,7 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
             if let Type::Builder(ref kind) = builder.ty {
                 let builder_sym = gen_expr(builder, glob_ctx, local_ctx)?;
                 match *kind {
-                    BuilderKind::Merger(_, _) => Ok(local_ctx.get_merger_val(&builder_sym)),
+                    BuilderKind::Merger(_, _) => Ok(builder_sym),
                     _ => weld_err!("Builder kind not supported: {}", print_expr(builder)),
                 }
             } else {
@@ -412,30 +372,14 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
     }
 }
 
-fn gen_merge(merger_sym: &Symbol, value_sym: &Symbol,
-             glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx) {
-    let new_value_sym = glob_ctx.add_variable();
-    let old_value_sym = local_ctx.update_merger_val(&merger_sym,
-                                                    new_value_sym.clone());
-    let binop = local_ctx.get_merger_state(merger_sym).binop;
-    glob_ctx.code.add(format!("val {new_val} = {old_val} {op} {value}",
-                              new_val=gen_sym(&new_value_sym),
-                              old_val=gen_sym(&old_value_sym),
-                              op=binop,
-                              value=gen_sym(&value_sym)));
-}
-
-fn gen_new_merger(elem_ty: &Type, binop: BinOpKind,
-                  glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx,
-                  merger_sym: Option<&Symbol>)
-                  -> WeldResult<Symbol> {
+fn gen_new_merger(elem_ty: &Type, glob_ctx: &mut GlobalCtx,
+                  merger_sym: Option<&Symbol>) -> WeldResult<Symbol> {
     let elem_type_scala = gen_scalar_type(elem_ty, format!("Not supported merger type: {}",
                                                            print_type(elem_ty)))?;
     let init_sym = merger_sym.map_or_else(|| glob_ctx.add_variable(), Symbol::clone);
     // TODO(zhangwen): this probably doesn't work for Boolean.
     // TODO(zhangwen): this also doesn't work for, say, multiplication.
     glob_ctx.code.add(format!("val {} = 0.to[{}]", gen_sym(&init_sym), elem_type_scala));
-    local_ctx.new_merger(init_sym.clone(), binop);
     Ok(init_sym)
 }
 

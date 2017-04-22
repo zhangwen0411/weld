@@ -13,7 +13,7 @@ object MergerNestedMerge extends SpatialApp {
     setMem(v_0, param_v_0)
     val out = ArgOut[Long]
     Accel {
-      val tmp_1 : Long = 0
+      val tmp_1 = 0.to[Long]
       assert((tmp_0+0) % 16 == 0)
       val tmp_2 = Reduce(Reg[Long])(tmp_0 by 16){ i =>
         val tmp_3 = SRAM[Long](16)
@@ -21,16 +21,15 @@ object MergerNestedMerge extends SpatialApp {
         Reduce(Reg[Long])(16 by 1){ ii =>
           val i_0 = (i + ii).to[Long]
           val e_0 = tmp_3(ii)
-          val b_0 : Long = 0
+          val b_0 = 0.to[Long]
           val tmp_4 = b_0 + i_0
           val tmp_5 = 5.to[Long]
           val tmp_6 = tmp_5 * e_0
           val tmp_7 = tmp_4 + tmp_6
           tmp_7
         }{ _+_ }
-      }{ _+_ }
-      val tmp_8 = tmp_1 + tmp_2
-      out := tmp_8
+      }{ _+_ } + tmp_1
+      out := tmp_2
     }
     getArg(out)
   }
