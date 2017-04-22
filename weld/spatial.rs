@@ -328,7 +328,8 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                                                   merger_type_scala,
                                                   BLK_SIZE));
 
-                        glob_ctx.code.add(format!("val {} = i + ii", gen_sym(i_sym)));
+                        // TODO(zhangwen): Spatial indices are 32-bit.
+                        glob_ctx.code.add(format!("val {} = (i + ii).to[Long]", gen_sym(i_sym)));
                         glob_ctx.code.add(format!("val {} = {}(ii)",
                                                   gen_sym(e_sym), gen_sym(&sram_sym)));
 
@@ -433,7 +434,7 @@ fn gen_new_merger(elem_ty: &Type, binop: BinOpKind,
     let init_sym = merger_sym.map_or_else(|| glob_ctx.add_variable(), Symbol::clone);
     // TODO(zhangwen): this probably doesn't work for Boolean.
     // TODO(zhangwen): this also doesn't work for, say, multiplication.
-    glob_ctx.code.add(format!("val {} : {} = 0", gen_sym(&init_sym), elem_type_scala));
+    glob_ctx.code.add(format!("val {} = 0.to[{}]", gen_sym(&init_sym), elem_type_scala));
     local_ctx.new_merger(init_sym.clone(), binop);
     Ok(init_sym)
 }
@@ -463,7 +464,7 @@ fn gen_lit(lit: LiteralKind) -> String {
         LiteralKind::F32Literal(f) => (f.to_string(), "Float"),  // TODO(zhangwen): this works?
         LiteralKind::F64Literal(f) => (f.to_string(), "Double"),
     };
-    format!("{}.as[{}]", val_str, type_str)
+    format!("{}.to[{}]", val_str, type_str)
 }
 
 fn gen_sym(sym: &Symbol) -> String {

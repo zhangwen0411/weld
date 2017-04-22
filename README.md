@@ -155,29 +155,29 @@ from Weld.
 To see Spatial code generation in action, run `repl --spatial` and enter Weld expressions as
 usual.  The Spatial code generator will spit out Spatial code if it understands the expression.
 
-Example Spatial `repl` session:
+For example, if you enter the Weld function:
 ```
->> |v: vec[i64]| result(for(v, merger[i64,+], |b, i, e| merge(b, e)))
-[...]
-
-Spatial code:
+|v: vec[i64]| result(for(v, merger[i64,+], |b, i, e| merge(b, e*i)))
+```
+the following Spatial code might be generated:
+```scala
 @virtualize
-def spatialProg(param_v_0: Array[Int]) = {
-  val tmp_0 = ArgIn[Int]
+def spatialProg(param_v_0: Array[Long]) = {
+  val tmp_0 = ArgIn[Index]
   setArg(tmp_0, param_v_0.length)
-  val v_0 = DRAM[Int](tmp_0)
+  val v_0 = DRAM[Long](tmp_0)
   setMem(v_0, param_v_0)
-  val out = ArgOut[Int]
+  val out = ArgOut[Long]
   Accel {
-    val tmp_1 : Int = 0
+    val tmp_1 : Long = 0
     assert((tmp_0+0) % 16 == 0)
-    val tmp_2 = Reduce(Reg[Int])(tmp_0 by 16){ i =>
-      val tmp_3 = SRAM[Int](16)
+    val tmp_2 = Reduce(Reg[Long])(tmp_0 by 16){ i =>
+      val tmp_3 = SRAM[Long](16)
       tmp_3 load v_0(i::i+16)
-      Reduce(Reg[Int])(16 by 1){ ii =>
+      Reduce(Reg[Long])(16 by 1){ ii =>
         val i_0 = i + ii
         val e_0 = tmp_3(ii)
-        val b_0 : Int = 0
+        val b_0 : Long = 0
         val tmp_4 = b_0 + e_0
         tmp_4
       }{ _+_ }
@@ -195,22 +195,26 @@ along with other boilerplate.  Here is an example:
 import spatial._
 import org.virtualized._
 
-object Foo extends SpatialApp {
+object MergerSimple extends SpatialApp {
   import IR._
 
   @virtualize
-  def spatialProg(param_v_0: Array[Int]) = {
+  def spatialProg(param_v_0: Array[Long]) = {
     // [Insert Spatial code from above]
   }
 
   @virtualize
   def main() {
-    // Generate an array of 160 integers.
-    val N = 160
-    val a = Array.tabulate(N){ i => i % 256 }
+    val N = 1600
+    val a = Array.tabulate(N){ i => (i % 97).to[Long] }
 
     val result = spatialProg(a)
     println("result: " + result)
+
+    val gold = a.zip(Array.tabulate(N){ i => i.to[Long] }){_*_}.reduce{_+_}
+    println("gold: " + gold)
+    val cksum = gold == result
+    println("PASS: " + cksum + " (MergerSimple)")
   }
 }
 ```

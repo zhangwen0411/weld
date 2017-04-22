@@ -22,7 +22,7 @@ object MergerConditional extends SpatialApp {
           val i_0 = i + ii
           val e_0 = tmp_3(ii)
           val b_0 : Int = 0
-          val tmp_4 = 0.as[Int]
+          val tmp_4 = 0.to[Int]
           val tmp_5 = e_0 > tmp_4
           val tmp_6 = b_0 + e_0
           val tmp_7 = -e_0

@@ -8,11 +8,11 @@ object MergerNestedFor extends SpatialApp {
   //   for(y, b1, |b2, i2, e2| merge(b2, e1*e2))))
   @virtualize
   def spatialProg(param_x_0: Array[Int], param_y_0: Array[Int]) = {
-    val tmp_0 = ArgIn[Int]
+    val tmp_0 = ArgIn[Index]
     setArg(tmp_0, param_x_0.length)
     val x_0 = DRAM[Int](tmp_0)
     setMem(x_0, param_x_0)
-    val tmp_1 = ArgIn[Int]
+    val tmp_1 = ArgIn[Index]
     setArg(tmp_1, param_y_0.length)
     val y_0 = DRAM[Int](tmp_1)
     setMem(y_0, param_y_0)
