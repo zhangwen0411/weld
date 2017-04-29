@@ -11,6 +11,7 @@ use super::util::SymbolGenerator;
 struct GlobalCtx {
     sym_gen: SymbolGenerator,
     code_builders: Vec<CodeBuilder>,
+    pub additional_init: CodeBuilder,
 }
 
 impl GlobalCtx {
@@ -18,6 +19,9 @@ impl GlobalCtx {
         GlobalCtx {
             code_builders: Vec::new(),
             sym_gen: SymbolGenerator::from_expression(weld_ast),
+
+            // Additional code added before Accel block.
+            additional_init: CodeBuilder::new(),
         }
     }
 
@@ -128,9 +132,16 @@ pub fn ast_to_spatial(expr: &TypedExpr) -> WeldResult<String> {
             gen_spatial_output_setup(&body.ty)?;
         add_code!(glob_ctx, "{}", output_prologue);
 
+        glob_ctx.enter_builder_scope();
+        let res_sym = gen_expr(body, &mut glob_ctx, &mut local_ctx)?;
+        let accel_body = glob_ctx.exit_builder_scope();
+
+        let additional_init_code = glob_ctx.additional_init.result().to_string();
+        add_code!(glob_ctx, "{}", additional_init_code);
+
         // Generate Spatial code (Accel block).
         add_code!(glob_ctx, "Accel {{");
-        let res_sym = gen_expr(body, &mut glob_ctx, &mut local_ctx)?;
+        add_code!(glob_ctx, "{}", accel_body);
         add_code!(glob_ctx, "{}", output_body.replace("$RES_SYM", &gen_sym(&res_sym)));
         add_code!(glob_ctx, "}}"); // Accel
 
@@ -278,6 +289,10 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                 weld_err!("Not supported: iter with start, end, and/or stride")?
             }
             let data_res = gen_expr(&iter.data, glob_ctx, local_ctx)?;
+            let data_ty = match iter.data.ty {
+                Type::Vector(ref ty) => ty,
+                _ => weld_err!("Iter doesn't have a vector: {}", print_expr(expr))?
+            };
 
             // builder
             let builder_sym = gen_expr(builder, glob_ctx, local_ctx)?;
@@ -298,7 +313,7 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                                         b_sym, i_sym, e_sym, glob_ctx, local_ctx),
 
                     BuilderKind::VecMerger(ref elem_ty, binop) =>
-                        gen_vecmerger_loop(&data_res, elem_ty, body, &builder_sym, binop,
+                        gen_vecmerger_loop(&data_res, data_ty, elem_ty, body, &builder_sym, binop,
                                            b_sym, i_sym, e_sym, glob_ctx, local_ctx),
 
                     _ => weld_err!("Builder kind not supported: {}", print_expr(builder))
@@ -411,7 +426,7 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
 }
 
 // FIXME(zhangwen): side effects should respect conditionals!!!
-fn gen_vecmerger_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
+fn gen_vecmerger_loop(data_sym: &Symbol, data_ty: &Type, dst_ty: &Type, body: &TypedExpr,
                       dst_sym: &Symbol, binop: BinOpKind,
                       b_sym: &Symbol, i_sym: &Symbol, e_sym: &Symbol,
                       glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx)
@@ -422,8 +437,10 @@ fn gen_vecmerger_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
     let dst_veclen_sym = local_ctx.get_veclen_sym(dst_sym, glob_ctx);
 
     // Merge into blocks of vecmerger, one by one.
-    let elem_ty_scala = gen_scalar_type(elem_ty, format!(
-            "Not supported vecmerger elem type: {}", print_type(elem_ty)))?;
+    let dst_ty_scala = gen_scalar_type(dst_ty, format!(
+            "Not supported vecmerger elem type: {}", print_type(dst_ty)))?;
+    let data_ty_scala = gen_scalar_type(data_ty, format!(
+            "Not supported data vec elem type: {}", print_type(data_ty)))?;
     let dst_sram_sym = glob_ctx.add_variable();
     let range_start_sym = glob_ctx.add_variable();
     let data_len_sym = local_ctx.get_veclen_sym(data_sym, glob_ctx);
@@ -457,7 +474,7 @@ fn gen_vecmerger_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
 
                 Pipe(piece_len by {data_blk}) {{ i2 =>
                     val base = i1 + i2
-                    val {data_sram} = SRAM[{ty}]({data_blk})
+                    val {data_sram} = SRAM[{data_ty}]({data_blk})
                     {data_sram} load {data_dram}(base::base+{data_blk})
 
                     Pipe({data_blk} by 1) {{ i3 =>
@@ -480,7 +497,8 @@ fn gen_vecmerger_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
         rs              = gen_sym(&range_start_sym),
         dst_sram        = gen_sym(&dst_sram_sym),
         dst_dram        = gen_sym(&dst_sym),
-        ty              = elem_ty_scala,
+        ty              = dst_ty_scala,
+        data_ty         = data_ty_scala,
         data_len        = gen_sym(&data_len_sym),
         data_blk        = BLK_SIZE_SRC,
         data_sram       = gen_sym(&src_sram_sym),
@@ -553,9 +571,8 @@ fn gen_new_vecmerger(vec_sym: &Symbol, elem_ty: &Type, glob_ctx: &mut GlobalCtx,
                                                            print_type(elem_ty)))?;
     let vecmerger_sym = glob_ctx.add_variable();
     let veclen_sym = local_ctx.get_veclen_sym(vec_sym, glob_ctx);
-    // FIXME(zhangwen): needs to be defined outside.
-    add_code!(glob_ctx, "val {} = DRAM[{}]({})",
-              gen_sym(&vecmerger_sym), elem_type_scala, gen_sym(&veclen_sym));
+    glob_ctx.additional_init.add(format!("val {} = DRAM[{}]({})",
+              gen_sym(&vecmerger_sym), elem_type_scala, gen_sym(&veclen_sym)));
     local_ctx.set_veclen_sym(&vecmerger_sym, &veclen_sym);
 
     // Copy from `vec_sym` to `vecmerger_sym`.
