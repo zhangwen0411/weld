@@ -270,13 +270,43 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
 
         ExprKind::If { ref cond, ref on_true, ref on_false } => {
             let cond_sym = gen_expr(cond, glob_ctx, local_ctx)?;
-            let mut true_local_ctx = local_ctx.clone();
-            let on_true_sym = gen_expr(on_true, glob_ctx, &mut true_local_ctx)?;
-            let mut false_local_ctx = local_ctx.clone();
-            let on_false_sym = gen_expr(on_false, glob_ctx, &mut false_local_ctx)?;
 
-            let res_sym = gen_mux(&cond_sym, &on_true_sym, &on_false_sym, glob_ctx);
-            Ok(res_sym)
+            let mut true_local_ctx = local_ctx.clone();
+            glob_ctx.enter_builder_scope();
+            let on_true_sym = gen_expr(on_true, glob_ctx, &mut true_local_ctx)?;
+            let on_true_code = glob_ctx.exit_builder_scope();
+
+            let mut false_local_ctx = local_ctx.clone();
+            glob_ctx.enter_builder_scope();
+            let on_false_sym = gen_expr(on_false, glob_ctx, &mut false_local_ctx)?;
+            let on_false_code = glob_ctx.exit_builder_scope();
+
+            if is_spatial_mutable(&expr.ty) {
+                if on_true_sym != on_false_sym {
+                    weld_err!("Not supported: if branches return different things {}",
+                              print_expr(expr))
+                } else {
+                    // In this case, the symbol must have been defined outside the `if`.
+                    add_code!(glob_ctx, "\
+                        if ({cond}) {{
+                            {on_true_code}
+                        }} else {{
+                            {on_false_code}
+                        }}",
+
+                        cond=gen_sym(&cond_sym),
+                        on_true_code=on_true_code,
+                        on_false_code=on_false_code);
+
+                    Ok(on_true_sym)
+                }
+            } else {
+                // Mux the two values!
+                add_code!(glob_ctx, "{}", on_true_code);
+                add_code!(glob_ctx, "{}", on_false_code);
+                let res_sym = gen_mux(&cond_sym, &on_true_sym, &on_false_sym, glob_ctx);
+                Ok(res_sym)
+            }
         }
 
         ExprKind::For { ref iters, ref builder, ref func } => {
@@ -627,3 +657,19 @@ fn gen_sym(sym: &Symbol) -> String {
     format!("{}_{}", sym.name, sym.id)
 }
 
+/// Returns true if a Spatial variable for a Weld value of type `ty` is mutable, e.g. for
+/// vecmerger.
+fn is_spatial_mutable(ty: &Type) -> bool {
+    match *ty {
+        Type::Builder(ref kind) => {
+            match *kind {
+                BuilderKind::Appender(_) => true,
+                BuilderKind::DictMerger(_, _, _) => true,
+                BuilderKind::VecMerger(_, _) => true,
+                _ => false,
+            }
+        }
+
+        _ => false
+    }
+}
