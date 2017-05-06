@@ -1,10 +1,10 @@
 import spatial._
 import org.virtualized._
 
-object VecMergerSimple extends SpatialApp {
+object VecMergerNestedMerge extends SpatialApp {
   import IR._
 
-  // |x:vec[i32]| result(for(x, vecmerger[i32,+](x), |b,i,e| merge(b, {i,e*7})))
+  // |x:vec[i32]| result(for(x, vecmerger[i32,+](x), |b,i,e| merge(merge(b, {i,e*7}), {i,e*8})))
   @virtualize
   def spatialProg(param_x_0: Array[Int]) = {
     val tmp_0 = ArgIn[Index]
@@ -49,6 +49,12 @@ object VecMergerSimple extends SpatialApp {
                   if (tmp_9 >= 0 && tmp_9 < 16) {
                     tmp_5(tmp_9) = tmp_5(tmp_9) + tmp_7
                   }
+                  val tmp_10 = 8.to[Int]
+                  val tmp_11 = e_0 * tmp_10
+                  val tmp_13 = i_0.to[Index] - tmp_3
+                  if (tmp_13 >= 0 && tmp_13 < 16) {
+                    tmp_5(tmp_13) = tmp_5(tmp_13) + tmp_11
+                  }
                   
                 }
               }  // Pipe
@@ -70,13 +76,13 @@ object VecMergerSimple extends SpatialApp {
     val a = Array.tabulate(N){ i => (i % 97) }
     val result = spatialProg(a)
 
-    val gold = Array.tabulate(N){ i => ((i % 97) * 8) }
+    val gold = Array.tabulate(N){ i => ((i % 97) * 16) }
     val cksum = result.zip(gold){_ == _}.reduce{_&&_}
 
     printArray(result, "result:")
     printArray(gold, "gold:")
 
-    println("PASS: " + cksum  + " (VecMergerSimple)")
+    println("PASS: " + cksum  + " (VecMergerNestedMerge)")
   }
 }
 

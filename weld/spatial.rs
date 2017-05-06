@@ -141,8 +141,10 @@ pub fn ast_to_spatial(expr: &TypedExpr) -> WeldResult<String> {
 
         // Generate Spatial code (Accel block).
         add_code!(glob_ctx, "Accel {{");
+        add_code!(glob_ctx, "Sequential {{");
         add_code!(glob_ctx, "{}", accel_body);
         add_code!(glob_ctx, "{}", output_body.replace("$RES_SYM", &gen_sym(&res_sym)));
+        add_code!(glob_ctx, "}}"); // Sequential
         add_code!(glob_ctx, "}}"); // Accel
 
         // Return value.
@@ -289,9 +291,13 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                     // In this case, the symbol must have been defined outside the `if`.
                     add_code!(glob_ctx, "\
                         if ({cond}) {{
-                            {on_true_code}
+                            Sequential {{
+                                {on_true_code}
+                            }}
                         }} else {{
-                            {on_false_code}
+                            Sequential {{
+                                {on_false_code}
+                            }}
                         }}",
 
                         cond=gen_sym(&cond_sym),
@@ -512,7 +518,9 @@ fn gen_vecmerger_loop(data_sym: &Symbol, data_ty: &Type, dst_ty: &Type, body: &T
                         val {i_sym} = (base + i3).to[Long]
                         val {e_sym} = {data_sram}(i3)
 
-                        {body_code}
+                        Sequential {{
+                            {body_code}
+                        }}
                     }}  // Pipe
                 }}  // Foreach
 
@@ -574,7 +582,11 @@ fn gen_merger_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
             Reduce(Reg[{ty}])({blk} by 1){{ ii =>
                 val {i_sym} = (i + ii).to[Long]
                 val {e_sym} = {sram}(ii)
-                {body_code}
+
+                Sequential {{
+                    {body_code}
+                }}
+
                 {body_res}
             }} {{ _{binop}_ }}  // Reduce
         }} {{ _{binop}_ }} {binop} {init_value}  // Reduce",
@@ -608,11 +620,18 @@ fn gen_new_vecmerger(vec_sym: &Symbol, elem_ty: &Type, glob_ctx: &mut GlobalCtx,
     // Copy from `vec_sym` to `vecmerger_sym`.
     // FIXME(zhangwen): do this lazily.
     const BLK_SIZE: i32 = 16; // TODO(zhangwen): tunable parameter.
-    add_code!(glob_ctx, "Pipe({} by {}) {{ i =>", gen_sym(&veclen_sym), BLK_SIZE);
-    add_code!(glob_ctx, "val ss = SRAM[{}]({})", elem_type_scala, BLK_SIZE);
-    add_code!(glob_ctx, "ss load {}(i::i+{})", gen_sym(&vec_sym), BLK_SIZE);
-    add_code!(glob_ctx, "{}(i::i+{}) store ss", gen_sym(&vecmerger_sym), BLK_SIZE);
-    add_code!(glob_ctx, "}}"); // Pipe
+    add_code!(glob_ctx, "\
+        Pipe({veclen} by {blk}) {{ i =>
+            val ss = SRAM[{ty}]({blk})
+            ss load {vec}(i::i+{blk})
+            {vecmerger}(i::i+{blk}) store ss
+        }} // Pipe",
+
+        veclen      = gen_sym(&veclen_sym),
+        blk         = BLK_SIZE,
+        ty          = elem_type_scala,
+        vec         = gen_sym(&vec_sym),
+        vecmerger   = gen_sym(&vecmerger_sym));
 
     Ok(vecmerger_sym)
 }
