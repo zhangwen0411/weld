@@ -22,6 +22,7 @@ use weld::*;
 use weld::ast::TypedExpr;
 use weld::llvm::LlvmGenerator;
 use weld::parser::*;
+use weld::passes::*;
 use weld::pretty_print::*;
 use weld::type_inference::*;
 use weld::sir::ast_to_sir;
@@ -208,12 +209,6 @@ fn main() {
         let mut expr = expr.unwrap();
         println!("After macro substitution:\n{}\n", print_expr(&expr));
 
-        transforms::inline_apply(&mut expr);
-        println!("After inline_apply:\n{}\n", print_expr(&expr));
-
-        transforms::uniquify(&mut expr);
-        println!("After uniquify :\n{}\n", print_expr(&expr));
-
         if let Err(ref e) = infer_types(&mut expr) {
             println!("Error during type inference: {}\n", e);
             println!("Partially inferred types:\n{}\n", print_typed_expr(&expr));
@@ -224,17 +219,18 @@ fn main() {
 
         let mut expr = expr.to_typed().unwrap();
 
-        transforms::inline_zips(&mut expr);
-        println!("After inlining zips:\n{}\n", print_typed_expr(&expr));
+        let passes: Vec<&Pass> = vec![
+            OPTIMIZATION_PASSES.get("inline-apply").unwrap(),
+            OPTIMIZATION_PASSES.get("inline-let").unwrap(),
+            OPTIMIZATION_PASSES.get("inline-zip").unwrap(),
+            OPTIMIZATION_PASSES.get("loop-fusion").unwrap(),
+            OPTIMIZATION_PASSES.get("uniquify").unwrap()
+        ];
 
-
-        transforms::fuse_loops_horizontal(&mut expr);
-        println!("After horizontal loop fusion:\n{}\n",
-                 print_typed_expr(&expr));
-
-        transforms::fuse_loops_vertical(&mut expr);
-        transforms::uniquify(&mut expr);
-        println!("After vertical loop fusion:\n{}\n", print_typed_expr(&expr));
+        for i in 0..passes.len() {
+            passes[i].transform(&mut expr).unwrap();
+            println!("After {} pass:\n{}\n", passes[i].pass_name(), print_expr(&expr));
+        }
 
         println!("final program raw: {:?}", expr);
 
