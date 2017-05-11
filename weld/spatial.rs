@@ -55,10 +55,49 @@ struct VecMergerState {
     range_size: i32,
 }
 
+#[derive(Clone, PartialEq)]
+enum AppenderState {
+    Fresh, // Hasn't been used
+    Map { sram_sym: Symbol, ii_sym: Symbol }, // Is being used in a map operation
+    Filter, // Is being used in a filter operation
+    Dead, // Can no longer be used
+    // For now there's no invalid state because an unsupported operation terminates compilation.
+}
+
+#[derive(Debug, PartialEq)]
+enum AppenderUsage {
+    Unused,
+    Once,
+    AtMostOnce,
+    Unsupported,
+}
+
+impl AppenderUsage {
+    fn compose_seq(self, other: AppenderUsage) -> AppenderUsage {
+        use self::AppenderUsage::*;
+        match (self, other) {
+            (u @ _, Unused) | (Unused, u @ _) => u,
+            _ => Unsupported,
+        }
+    }
+
+    fn compose_or(self, other: AppenderUsage) -> AppenderUsage {
+        use self::AppenderUsage::*;
+        match (self, other) {
+            (Unused, Once) | (Once, Unused) => AtMostOnce,
+            (Once, Once) => Once,
+            (Unused, Unused) => Unused,
+            (Unused, AtMostOnce) | (AtMostOnce, Unused) => AtMostOnce,
+            _ => Unsupported,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct LocalCtx {
     veclen_sym: HashMap<Symbol, Symbol>, // symbol for vector => symbol for vector length
     vecmergers: HashMap<Symbol, VecMergerState>,
+    pub appenders: HashMap<Symbol, AppenderState>,
     pub structs: HashMap<Symbol, Box<Vec<Symbol>>>, // symbol for struct value => components
 }
 
@@ -67,6 +106,7 @@ impl LocalCtx {
         LocalCtx {
             veclen_sym: HashMap::new(),
             vecmergers: HashMap::new(),
+            appenders: HashMap::new(),
             structs: HashMap::new(),
         }
     }
@@ -352,7 +392,43 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                         gen_vecmerger_loop(&data_res, data_ty, elem_ty, body, &builder_sym, binop,
                                            b_sym, i_sym, e_sym, glob_ctx, local_ctx),
 
-                    _ => weld_err!("Builder kind not supported: {}", print_expr(builder))
+                    BuilderKind::Appender(ref elem_ty) => {
+                        // Prohibit the appender from being used again.
+                        let old_state = local_ctx.appenders.insert(builder_sym.clone(),
+                                                                   AppenderState::Dead).unwrap();
+                        // Make sure that the appender was fresh.
+                        if old_state != AppenderState::Fresh {
+                            weld_err!("Appender {} reused: {}", builder_sym, print_expr(expr))?;
+                        }
+
+                        let (usage, ret) = compute_appender_usage(body, b_sym);
+                        if !ret {
+                            weld_err!("For loop body doesn't return builder: {}",
+                                      print_expr(expr))?;
+                        }
+
+                        match usage {
+                            // Assuming that the for loop can only merge into the builder
+                            // provided to it, that would be its only possible side effect.
+                            // If such merge doesn't happen, why bother generating code for the
+                            // loop body?
+                            AppenderUsage::Unused => Ok(builder_sym),
+
+                            AppenderUsage::Once =>
+                                gen_map_loop(&data_res, elem_ty, body, &builder_sym,
+                                             b_sym, i_sym, e_sym, glob_ctx, local_ctx),
+
+                            AppenderUsage::AtMostOnce =>
+                                gen_filter_loop(&data_res, elem_ty, body, &builder_sym,
+                                                b_sym, i_sym, e_sym, glob_ctx, local_ctx),
+
+                            AppenderUsage::Unsupported =>
+                                weld_err!("Unsupported appender usage {:?}: {}",
+                                          usage, print_expr(expr)),
+                        }
+                    }
+
+                    _ => weld_err!("For: builder kind not supported: {}", print_expr(expr))
                 }
             } else {
                 weld_err!("Argument to For was not a Lambda: {}", print_expr(func))
@@ -371,7 +447,9 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                         gen_new_vecmerger(&vec_sym, elem_ty, glob_ctx, local_ctx)
                     }
 
-                    _ => weld_err!("Builder kind not supported: {}", print_expr(expr))
+                    BuilderKind::Appender(_) => gen_new_appender(glob_ctx, local_ctx),
+
+                    _ => weld_err!("NewBuilder: builder kind not supported: {}", print_expr(expr))
                 }
             } else {
                 weld_err!("NewBuilder doesn't produce a builder: {}", print_expr(expr))
@@ -408,7 +486,7 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                         let offset_sym = glob_ctx.add_variable();
                         let offset_sym_name = gen_sym(&offset_sym);
                         // TODO(zhangwen): will break if index overflows 32-bit int.
-                        add_code!(glob_ctx,"\
+                        add_code!(glob_ctx, "\
                                   val {offset} = {index}.to[Index] - {start}
                                   if ({offset} >= 0 && {offset} < {range_size}) {{
                                       {sram}({offset}) = {sram}({offset}) {binop} {value}
@@ -424,7 +502,23 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                         Ok(builder_sym)
                     }
 
-                    _ => weld_err!("Builder kind not supported: {}", print_expr(builder))
+                    BuilderKind::Appender(_) => {
+                        use self::AppenderState::*;
+                        let appender_state = local_ctx.appenders.get(&builder_sym).unwrap();
+                        match *appender_state {
+                            Map { ref sram_sym, ref ii_sym } => {
+                                add_code!(glob_ctx, "{sram}({ii}) = {value}",
+                                          sram=gen_sym(&sram_sym),
+                                          ii=gen_sym(&ii_sym),
+                                          value=gen_sym(&value_res));
+                                Ok(builder_sym)
+                            }
+                            Filter => weld_err!("Not implemented: filter merge"),
+                            _ => weld_err!("Merge not supported: {}", print_expr(expr)),
+                        }
+                    }
+
+                    _ => weld_err!("Merge: builder kind not supported: {}", print_expr(expr))
                 }
             } else {
                 weld_err!("Merging into not a builder: {}", print_expr(builder))
@@ -437,7 +531,8 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                 match *kind {
                     BuilderKind::Merger(_, _) => Ok(builder_sym),
                     BuilderKind::VecMerger(_, _) => Ok(builder_sym),
-                    _ => weld_err!("Builder kind not supported: {}", print_expr(builder)),
+                    BuilderKind::Appender(_) => Ok(builder_sym),
+                    _ => weld_err!("Res: builder kind not supported: {}", print_expr(expr)),
                 }
             } else {
                 weld_err!("Res of not a builder: {}", print_expr(builder))
@@ -571,6 +666,7 @@ fn gen_merger_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
     let body_code = glob_ctx.exit_builder_scope();
 
     // TODO(zhangwen): Spatial indices are 32-bit.
+    // FIXME(zhangwen): do I need Sequential around body_code?
     add_code!(glob_ctx, "\
         // The % operator doesn't work on registers; the `+0` is a hack
         // to make it work.
@@ -583,10 +679,7 @@ fn gen_merger_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
                 val {i_sym} = (i + ii).to[Long]
                 val {e_sym} = {sram}(ii)
 
-                Sequential {{
-                    {body_code}
-                }}
-
+                {body_code}
                 {body_res}
             }} {{ _{binop}_ }}  // Reduce
         }} {{ _{binop}_ }} {binop} {init_value}  // Reduce",
@@ -605,6 +698,71 @@ fn gen_merger_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
         init_value  = gen_sym(&merger_sym));
 
     Ok(reduce_res)
+}
+
+
+fn gen_map_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
+                appender_sym: &Symbol, b_sym: &Symbol, i_sym: &Symbol, e_sym: &Symbol,
+                glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx) -> WeldResult<Symbol> {
+    let elem_type_scala = gen_scalar_type(elem_ty, format!("Not supported appender type: {}",
+                                                           print_type(elem_ty)))?;
+    let veclen_sym = local_ctx.get_veclen_sym(data_sym, glob_ctx);
+    // The result of a map operation has the same length as the data.
+    glob_ctx.additional_init.add(format!("val {} = DRAM[{}]({})",
+              gen_sym(&appender_sym), elem_type_scala, gen_sym(&veclen_sym)));
+    local_ctx.set_veclen_sym(&appender_sym, &veclen_sym);
+
+    let sram_dst_sym = glob_ctx.add_variable();
+    let ii_sym = glob_ctx.add_variable();
+
+    // Generate body code.
+    let mut sub_local_ctx = local_ctx.clone();
+    sub_local_ctx.appenders.insert(
+        b_sym.clone(),
+        AppenderState::Map { sram_sym: sram_dst_sym.clone(), ii_sym: ii_sym.clone() });
+    glob_ctx.enter_builder_scope();
+    let body_res = gen_expr(body, glob_ctx, &mut sub_local_ctx)?;
+    assert_eq!(body_res, *b_sym); // Body should return builder derived from `b`.
+    let body_code = glob_ctx.exit_builder_scope();
+
+    const BLK_SIZE: i32 = 16;
+    add_code!(glob_ctx, "\
+        assert(({veclen}+0) % {blk} == 0)
+        Pipe({veclen} by {blk}) {{ i =>
+            val sram_data = SRAM[{ty}]({blk})
+            val {sram_dst} = SRAM[{ty}]({blk})
+            sram_data load {data}(i::i+{blk})
+            Foreach({blk} by 1) {{ {ii} =>
+                val {i_sym} = (i + {ii}).to[Long]
+                val {e_sym} = sram_data({ii})
+
+                Sequential {{
+                    {body_code}
+                }}
+            }}
+            {dst}(i::i+{blk}) store {sram_dst}
+        }}",
+
+        veclen      = gen_sym(&veclen_sym),
+        blk         = BLK_SIZE,
+        ty          = elem_type_scala,
+        sram_dst    = gen_sym(&sram_dst_sym),
+        data        = gen_sym(&data_sym),
+        ii          = gen_sym(&ii_sym),
+        i_sym       = gen_sym(&i_sym),
+        e_sym       = gen_sym(&e_sym),
+        body_code   = body_code,
+        dst         = gen_sym(&appender_sym));
+
+    Ok(appender_sym.clone())
+}
+
+#[allow(unused_variables)]
+fn gen_filter_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
+                   appender_sym: &Symbol, b_sym: &Symbol, i_sym: &Symbol, e_sym: &Symbol,
+                   glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx) -> WeldResult<Symbol> {
+    weld_err!("Not implemented: filter loop")
+    // TODO(zhangwen): implement this.
 }
 
 fn gen_new_vecmerger(vec_sym: &Symbol, elem_ty: &Type, glob_ctx: &mut GlobalCtx,
@@ -634,6 +792,13 @@ fn gen_new_vecmerger(vec_sym: &Symbol, elem_ty: &Type, glob_ctx: &mut GlobalCtx,
         vecmerger   = gen_sym(&vecmerger_sym));
 
     Ok(vecmerger_sym)
+}
+
+fn gen_new_appender(glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx) -> WeldResult<Symbol> {
+    let appender_sym = glob_ctx.add_variable();
+    // Don't declare underlying DRAM yet.
+    local_ctx.appenders.insert(appender_sym.clone(), AppenderState::Fresh);
+    Ok(appender_sym)
 }
 
 fn gen_new_merger(elem_ty: &Type, glob_ctx: &mut GlobalCtx,
@@ -690,5 +855,96 @@ fn is_spatial_mutable(ty: &Type) -> bool {
         }
 
         _ => false
+    }
+}
+
+/// Returns appender usage, and true if expr returns the same appender.
+fn compute_appender_usage(expr: &TypedExpr, appender_sym: &Symbol) -> (AppenderUsage, bool) {
+    match expr.kind {
+        ExprKind::Literal(_) => (AppenderUsage::Unused, false),
+
+        ExprKind::Ident(ref sym) => (AppenderUsage::Unused, sym == appender_sym),
+
+        ExprKind::BinOp { ref left, ref right, .. } => {
+            let (left_usage, left_ret) = compute_appender_usage(left, appender_sym);
+            let (right_usage, right_ret) = compute_appender_usage(right, appender_sym);
+            assert!(!left_ret); // BinOp operands cannot be appenders.
+            assert!(!right_ret);
+            (left_usage.compose_seq(right_usage), false)
+        }
+
+        ExprKind::If { ref cond, ref on_true, ref on_false } => {
+            let (cond_usage, cond_ret) = compute_appender_usage(cond, appender_sym);
+            assert!(!cond_ret);  // A bool cannot be an appender.
+            let (true_usage, true_ret) = compute_appender_usage(on_true, appender_sym);
+            let (false_usage, false_ret) = compute_appender_usage(on_false, appender_sym);
+            if true_ret != false_ret {
+                // Unsupported if only one branch returns the appender in question.
+                (AppenderUsage::Unsupported, false)
+            } else {
+                (cond_usage.compose_seq(true_usage.compose_or(false_usage)), true_ret)
+            }
+        }
+
+        ExprKind::NewBuilder(ref opt) => {
+            if let Some(ref e) = *opt {
+                let (usage, ret) = compute_appender_usage(e, appender_sym);
+                assert!(!ret);
+                (usage, false)
+            } else {
+                (AppenderUsage::Unused, false)
+            }
+        }
+
+        ExprKind::For { ref iters, ref builder, ref func } => {
+            let mut usage = AppenderUsage::Unused;
+            for iter in iters {
+                let (iter_usage, iter_ret) = compute_appender_usage(iter.data.as_ref(),
+                                                                    appender_sym);
+                assert!(!iter_ret);  // A vector cannot be an appender.
+                usage = usage.compose_seq(iter_usage)
+            }
+
+            let (builder_usage, builder_ret) = compute_appender_usage(builder, appender_sym);
+            usage = usage.compose_seq(builder_usage);
+            if builder_ret {  // For loop might merge into appender in question.
+                if let ExprKind::Lambda { ref params, ref body } = func.kind {
+                    let ref b_sym = params[0].name;
+                    // In func, b_sym refers to the loop builder.
+                    let (func_usage, func_ret) = compute_appender_usage(body, b_sym);
+                    assert!(func_ret);  // Function body must return b_sym.
+                    if func_usage != AppenderUsage::Unused { usage = AppenderUsage::Unsupported; }
+                    (usage, true)
+                } else {
+                    panic!("For loop func is not a lambda")
+                }
+            } else {
+                (usage, false)
+            }
+        }
+
+        ExprKind::Merge { ref builder, ref value } => {
+            let (builder_usage, builder_ret) = compute_appender_usage(builder, appender_sym);
+            let (value_usage, value_ret) = compute_appender_usage(value, appender_sym);
+            assert!(!value_ret);  // Assuming that one cannot merge an appender into a builder...
+
+            let mut usage = builder_usage.compose_seq(value_usage);
+            if builder_ret {  // We're merging into the appender in question.
+                usage = usage.compose_seq(AppenderUsage::Once)
+            }
+            (usage, builder_ret)
+        }
+
+        ExprKind::Res { ref builder } => {
+            let (builder_usage, builder_ret) = compute_appender_usage(builder, appender_sym);
+            if builder_ret {
+                // This probably shouldn't happen (taking result of appender)...
+                (AppenderUsage::Unsupported, false)
+            } else {
+                (builder_usage, false)
+            }
+        }
+
+        _ => (AppenderUsage::Unsupported, false)
     }
 }
