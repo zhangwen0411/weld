@@ -11,7 +11,8 @@ use super::util::SymbolGenerator;
 struct GlobalCtx {
     sym_gen: SymbolGenerator,
     code_builders: Vec<CodeBuilder>,
-    pub additional_init: CodeBuilder,
+    pub extra_host_init: CodeBuilder,
+    pub extra_accel_init: CodeBuilder,
 }
 
 impl GlobalCtx {
@@ -20,8 +21,8 @@ impl GlobalCtx {
             code_builders: Vec::new(),
             sym_gen: SymbolGenerator::from_expression(weld_ast),
 
-            // Additional code added before Accel block.
-            additional_init: CodeBuilder::new(),
+            extra_host_init: CodeBuilder::new(), // Before Accel block
+            extra_accel_init: CodeBuilder::new(), // At the beginning of Accel block
         }
     }
 
@@ -40,6 +41,12 @@ impl GlobalCtx {
     pub fn add_code<S>(&mut self, code: S) where S: AsRef<str> {
         self.code_builders.last_mut().unwrap().add(code);
     }
+
+    pub fn add_dram(&mut self, sym: &Symbol, elem_ty_scala: &String, len: &Symbol)
+    {
+        self.extra_host_init.add(format!("val {} = DRAM[{}]({})",
+              gen_sym(&sym), elem_ty_scala, gen_sym(&len)));
+    }
 }
 
 macro_rules! add_code {
@@ -55,11 +62,22 @@ struct VecMergerState {
     range_size: i32,
 }
 
+#[derive(Clone)]
+struct VectorInfo {
+    len: Symbol, // Vector length.
+    len_bound: Symbol, // Static upper bound on vector length.
+}
+
 #[derive(Clone, PartialEq)]
 enum AppenderState {
     Fresh, // Hasn't been used
     Map { sram_sym: Symbol, ii_sym: Symbol }, // Is being used in a map operation
-    Filter, // Is being used in a filter operation
+
+    // Is being used in a filter operation.
+    // Here "filter" just means at "most one append for every element"; the value appended
+    // can be different from the original value.
+    Filter { sram_acc_sym: Symbol, sram_merge_sym: Symbol, ii_sym: Symbol },
+
     Dead, // Can no longer be used
     // For now there's no invalid state because an unsupported operation terminates compilation.
 }
@@ -95,7 +113,7 @@ impl AppenderUsage {
 
 #[derive(Clone)]
 struct LocalCtx {
-    veclen_sym: HashMap<Symbol, Symbol>, // symbol for vector => symbol for vector length
+    vectors: HashMap<Symbol, VectorInfo>,
     vecmergers: HashMap<Symbol, VecMergerState>,
     pub appenders: HashMap<Symbol, AppenderState>,
     pub structs: HashMap<Symbol, Box<Vec<Symbol>>>, // symbol for struct value => components
@@ -104,28 +122,28 @@ struct LocalCtx {
 impl LocalCtx {
     pub fn new() -> LocalCtx {
         LocalCtx {
-            veclen_sym: HashMap::new(),
+            vectors: HashMap::new(),
             vecmergers: HashMap::new(),
             appenders: HashMap::new(),
             structs: HashMap::new(),
         }
     }
 
-    // Two vectors of the same length (statically) should share a length symbol.
-    pub fn get_veclen_sym(&mut self, vec: &Symbol, glob_ctx: &mut GlobalCtx) -> Symbol {
-        let res = self.veclen_sym.get(vec).map(Symbol::clone);
-        match res {
-            Some(len_sym) => len_sym,
-            None => {
-                let len_sym = glob_ctx.add_variable();
-                self.veclen_sym.insert(vec.clone(), len_sym.clone());
-                len_sym
-            }
-        }
+    pub fn register_vec(&mut self, vec: &Symbol, len: &Symbol, len_bound: &Symbol) {
+        let vec_info = VectorInfo { len: len.clone(), len_bound: len_bound.clone() };
+        self.vectors.insert(vec.clone(), vec_info);
     }
 
-    pub fn set_veclen_sym(&mut self, vec: &Symbol, len_sym: &Symbol) {
-        self.veclen_sym.insert(vec.clone(), len_sym.clone());
+    /// Panics if vec hasn't been registered.
+    pub fn get_vec_info(&self, vec: &Symbol) -> VectorInfo {
+        self.vectors.get(vec).unwrap().clone()
+    }
+
+    /// Panics if vec hasn't been registered.
+    pub fn duplicate_vec_info(&mut self, vec: &Symbol, new_vec: &Symbol) -> VectorInfo {
+        let vec_info = self.vectors.get(vec).unwrap().clone();
+        self.vectors.insert(new_vec.clone(), vec_info.clone());
+        vec_info
     }
 
     pub fn set_vecmerger_state(&mut self, vecmerger_sym: &Symbol, sram_sym: &Symbol,
@@ -168,27 +186,27 @@ pub fn ast_to_spatial(expr: &TypedExpr) -> WeldResult<String> {
         }
 
         // Set up output.
-        let (output_prologue, output_body, output_epilogue) =
-            gen_spatial_output_setup(&body.ty)?;
+        let (output_prologue, output_body, output_epilogue) = gen_spatial_output_setup(&body.ty)?;
         add_code!(glob_ctx, "{}", output_prologue);
 
         glob_ctx.enter_builder_scope();
         let res_sym = gen_expr(body, &mut glob_ctx, &mut local_ctx)?;
         let accel_body = glob_ctx.exit_builder_scope();
 
-        let additional_init_code = glob_ctx.additional_init.result().to_string();
-        add_code!(glob_ctx, "{}", additional_init_code);
+        let extra_host_init_code = glob_ctx.extra_host_init.result().to_string();
+        add_code!(glob_ctx, "{}", extra_host_init_code);
 
         // Generate Spatial code (Accel block).
         add_code!(glob_ctx, "Accel {{");
-        add_code!(glob_ctx, "Sequential {{");
+        let extra_accel_init_code = glob_ctx.extra_accel_init.result().to_string();
+        add_code!(glob_ctx, "{}", extra_accel_init_code);
         add_code!(glob_ctx, "{}", accel_body);
-        add_code!(glob_ctx, "{}", output_body.replace("$RES_SYM", &gen_sym(&res_sym)));
-        add_code!(glob_ctx, "}}"); // Sequential
+
+        add_code!(glob_ctx, "{}", output_body(&res_sym, &local_ctx));
         add_code!(glob_ctx, "}}"); // Accel
 
         // Return value.
-        add_code!(glob_ctx, "{}", output_epilogue.replace("$RES_SYM", &gen_sym(&res_sym)));
+        add_code!(glob_ctx, "{}", output_epilogue(&res_sym, &local_ctx));
         add_code!(glob_ctx, "}}"); // def spatialProg
 
         Ok(glob_ctx.exit_builder_scope())
@@ -231,7 +249,9 @@ fn gen_spatial_input_param_setup(param: &Parameter<Type>,
             let err_msg = format!("Not supported: nested type {}", print_type(&param.ty));
             let elem_type_scala = gen_scalar_type(boxed_ty, err_msg)?;
 
-            let veclen_sym_name = gen_sym(&local_ctx.get_veclen_sym(&param.name, glob_ctx));
+            let veclen_sym = glob_ctx.add_variable();
+            local_ctx.register_vec(&param.name, &veclen_sym, &veclen_sym);
+            let veclen_sym_name = gen_sym(&veclen_sym);
             add_code!(glob_ctx, "val {} = ArgIn[Index]", veclen_sym_name);
             add_code!(glob_ctx, "setArg({}, {}.length)", veclen_sym_name, scala_param_name);
             add_code!(glob_ctx, "val {} = DRAM[{}]({})",
@@ -245,20 +265,31 @@ fn gen_spatial_input_param_setup(param: &Parameter<Type>,
     }
 }
 
+type CodeF = Box<Fn(&Symbol, &LocalCtx) -> String>;
+
 /// Returns (prologue, body, epilogue).
-fn gen_spatial_output_setup(ty: &Type)
-                            -> WeldResult<(String, String, String)> {
+fn gen_spatial_output_setup(ty: &Type) -> WeldResult<(String, CodeF, CodeF)> {
     match *ty {
-        Type::Scalar(scalar_kind) => Ok((
-            format!("val out = ArgOut[{}]", gen_scalar_type_from_kind(scalar_kind)),
-            String::from("out := $RES_SYM"),
-            String::from("getArg(out)")
-        )),
+        Type::Scalar(scalar_kind) => {
+            let prologue = format!("val out = ArgOut[{}]",
+                                   gen_scalar_type_from_kind(scalar_kind));
+            let body = Box::new(|res: &Symbol, _: &LocalCtx|
+                                format!("out := {}", gen_sym(&res)));
+            let epilogue = Box::new(|_: &Symbol, _: &LocalCtx|
+                                    String::from("getArg(out)"));
+            Ok((prologue, body, epilogue))
+        }
 
         Type::Vector(ref boxed_ty) => {
             let err_msg = format!("Not supported: nested type {}", print_type(ty));
             gen_scalar_type(boxed_ty, err_msg)?;
-            Ok((String::new(), String::new(), String::from("getMem($RES_SYM)")))
+
+            let prologue = String::from("val len = ArgOut[Index]");
+            let body = Box::new(|res: &Symbol, local_ctx: &LocalCtx|
+                                format!("len := {}", gen_sym(&local_ctx.get_vec_info(&res).len)));
+            let epilogue = Box::new(|res: &Symbol, _: &LocalCtx|
+                                    format!("pack(getMem({}), getArg(len))", gen_sym(&res)));
+            Ok((prologue, body, epilogue))
         }
 
         _ => weld_err!("Not supported: result type {}", print_type(ty))
@@ -329,15 +360,12 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                               print_expr(expr))
                 } else {
                     // In this case, the symbol must have been defined outside the `if`.
+                    // FIXME(zhangwen): I don't seem to need "Sequential" inside if body.  Why?
                     add_code!(glob_ctx, "\
                         if ({cond}) {{
-                            Sequential {{
-                                {on_true_code}
-                            }}
+                            {on_true_code}
                         }} else {{
-                            Sequential {{
-                                {on_false_code}
-                            }}
+                            {on_false_code}
                         }}",
 
                         cond=gen_sym(&cond_sym),
@@ -407,22 +435,14 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                                       print_expr(expr))?;
                         }
 
+                        use self::AppenderUsage::*;
                         match usage {
-                            // Assuming that the for loop can only merge into the builder
-                            // provided to it, that would be its only possible side effect.
-                            // If such merge doesn't happen, why bother generating code for the
-                            // loop body?
-                            AppenderUsage::Unused => Ok(builder_sym),
-
-                            AppenderUsage::Once =>
-                                gen_map_loop(&data_res, elem_ty, body, &builder_sym,
-                                             b_sym, i_sym, e_sym, glob_ctx, local_ctx),
-
-                            AppenderUsage::AtMostOnce =>
+                            Once => gen_map_loop(&data_res, elem_ty, body, &builder_sym,
+                                                 b_sym, i_sym, e_sym, glob_ctx, local_ctx),
+                            AtMostOnce =>
                                 gen_filter_loop(&data_res, elem_ty, body, &builder_sym,
                                                 b_sym, i_sym, e_sym, glob_ctx, local_ctx),
-
-                            AppenderUsage::Unsupported =>
+                            Unused | Unsupported =>
                                 weld_err!("Unsupported appender usage {:?}: {}",
                                           usage, print_expr(expr)),
                         }
@@ -513,7 +533,18 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                                           value=gen_sym(&value_res));
                                 Ok(builder_sym)
                             }
-                            Filter => weld_err!("Not implemented: filter merge"),
+
+                            Filter { ref sram_acc_sym, ref sram_merge_sym, ref ii_sym } => {
+                                add_code!(glob_ctx, "\
+                                          {sram_acc}({ii}) = 1.to[Index]
+                                          {sram_value}({ii}) = {value}",
+                                          sram_acc=gen_sym(&sram_acc_sym),
+                                          sram_value=gen_sym(&sram_merge_sym),
+                                          ii=gen_sym(&ii_sym),
+                                          value=gen_sym(&value_res));
+                                Ok(builder_sym)
+                            }
+
                             _ => weld_err!("Merge not supported: {}", print_expr(expr)),
                         }
                     }
@@ -556,7 +587,6 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
     }
 }
 
-// FIXME(zhangwen): side effects should respect conditionals!!!
 fn gen_vecmerger_loop(data_sym: &Symbol, data_ty: &Type, dst_ty: &Type, body: &TypedExpr,
                       dst_sym: &Symbol, binop: BinOpKind,
                       b_sym: &Symbol, i_sym: &Symbol, e_sym: &Symbol,
@@ -565,7 +595,7 @@ fn gen_vecmerger_loop(data_sym: &Symbol, data_ty: &Type, dst_ty: &Type, body: &T
     const BLK_SIZE_DST: i32 = 16; // TODO(zhangwen): tunable parameter.
     const BLK_SIZE_SRC: i32 = 16; // TODO(zhangwen): tunable parameter.
     const PAR: i32 = 4;
-    let dst_veclen_sym = local_ctx.get_veclen_sym(dst_sym, glob_ctx);
+    let dst_veclen_sym = &local_ctx.get_vec_info(&dst_sym).len;
 
     // Merge into blocks of vecmerger, one by one.
     let dst_ty_scala = gen_scalar_type(dst_ty, format!(
@@ -574,7 +604,7 @@ fn gen_vecmerger_loop(data_sym: &Symbol, data_ty: &Type, dst_ty: &Type, body: &T
             "Not supported data vec elem type: {}", print_type(data_ty)))?;
     let dst_sram_sym = glob_ctx.add_variable();
     let range_start_sym = glob_ctx.add_variable();
-    let data_len_sym = local_ctx.get_veclen_sym(data_sym, glob_ctx);
+    let data_len_sym = &local_ctx.get_vec_info(&data_sym).len;
     let src_sram_sym = glob_ctx.add_variable();
     let local_dst_sram_sym = glob_ctx.add_variable();
 
@@ -651,7 +681,7 @@ fn gen_merger_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
                    glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx) -> WeldResult<Symbol> {
     const BLK_SIZE: i32 = 16; // TODO(zhangwen): tunable parameter.
     // TODO(zhangwen): currently must divide vector size evenly.
-    let veclen_sym = local_ctx.get_veclen_sym(&data_sym, glob_ctx);
+    let veclen_sym = &local_ctx.get_vec_info(&data_sym).len;
     let reduce_res = glob_ctx.add_variable();
     let merger_type_scala = gen_scalar_type(elem_ty, format!(
             "Not supported merger elem type: {}", print_type(elem_ty)))?;
@@ -706,11 +736,9 @@ fn gen_map_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
                 glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx) -> WeldResult<Symbol> {
     let elem_type_scala = gen_scalar_type(elem_ty, format!("Not supported appender type: {}",
                                                            print_type(elem_ty)))?;
-    let veclen_sym = local_ctx.get_veclen_sym(data_sym, glob_ctx);
     // The result of a map operation has the same length as the data.
-    glob_ctx.additional_init.add(format!("val {} = DRAM[{}]({})",
-              gen_sym(&appender_sym), elem_type_scala, gen_sym(&veclen_sym)));
-    local_ctx.set_veclen_sym(&appender_sym, &veclen_sym);
+    let vec_info = local_ctx.duplicate_vec_info(&data_sym, &appender_sym);
+    glob_ctx.add_dram(&appender_sym, &elem_type_scala, &vec_info.len_bound);
 
     let sram_dst_sym = glob_ctx.add_variable();
     let ii_sym = glob_ctx.add_variable();
@@ -732,7 +760,7 @@ fn gen_map_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
             val sram_data = SRAM[{ty}]({blk})
             val {sram_dst} = SRAM[{ty}]({blk})
             sram_data load {data}(i::i+{blk})
-            Foreach({blk} by 1) {{ {ii} =>
+            Pipe({blk} by 1) {{ {ii} =>
                 val {i_sym} = (i + {ii}).to[Long]
                 val {e_sym} = sram_data({ii})
 
@@ -743,7 +771,7 @@ fn gen_map_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
             {dst}(i::i+{blk}) store {sram_dst}
         }}",
 
-        veclen      = gen_sym(&veclen_sym),
+        veclen      = gen_sym(&vec_info.len),
         blk         = BLK_SIZE,
         ty          = elem_type_scala,
         sram_dst    = gen_sym(&sram_dst_sym),
@@ -761,7 +789,125 @@ fn gen_map_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
 fn gen_filter_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
                    appender_sym: &Symbol, b_sym: &Symbol, i_sym: &Symbol, e_sym: &Symbol,
                    glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx) -> WeldResult<Symbol> {
-    weld_err!("Not implemented: filter loop")
+    let elem_type_scala = gen_scalar_type(elem_ty, format!("Not supported appender type: {}",
+                                                           print_type(elem_ty)))?;
+    // The result of a map operation has the same length as the data.
+    let data_vec_info = local_ctx.get_vec_info(&data_sym);
+    glob_ctx.add_dram(&appender_sym, &elem_type_scala, &data_vec_info.len_bound);
+    let result_veclen_sym = glob_ctx.add_variable();
+    glob_ctx.extra_accel_init.add(format!("val {} = Reg[Index]", gen_sym(&result_veclen_sym)));
+    local_ctx.register_vec(&appender_sym, &result_veclen_sym, &data_vec_info.len_bound);
+
+    let dram_acc_sym = glob_ctx.add_variable(); // Prefix sum.
+    glob_ctx.add_dram(&dram_acc_sym, &"Index".to_string(), &data_vec_info.len_bound);
+    // TODO(zhangwen): this is a lot of extra DRAM...
+    let dram_merge_sym = glob_ctx.add_variable(); // Merge values.
+    glob_ctx.add_dram(&dram_merge_sym, &elem_type_scala, &data_vec_info.len_bound);
+
+    let sram_acc_sym = glob_ctx.add_variable();
+    let sram_merge_sym = glob_ctx.add_variable();
+    let ii_sym = glob_ctx.add_variable();
+
+    // Generate body code.
+    let mut sub_local_ctx = local_ctx.clone();
+    sub_local_ctx.appenders.insert(
+        b_sym.clone(), AppenderState::Filter {
+            sram_acc_sym: sram_acc_sym.clone(),
+            sram_merge_sym: sram_merge_sym.clone(), ii_sym: ii_sym.clone()
+        });
+    glob_ctx.enter_builder_scope();
+    let body_res = gen_expr(body, glob_ctx, &mut sub_local_ctx)?;
+    assert_eq!(body_res, *b_sym); // Body should return builder derived from `b`.
+    let body_code = glob_ctx.exit_builder_scope();
+
+    const BLK_SIZE: i32 = 16;
+    const PAR: i32 = 4;
+    add_code!(glob_ctx, "\
+        // Compute condition on each element.
+        assert(({datalen}+0) % {blk} == 0)
+        Pipe({datalen} by {blk} par {par}) {{ i =>
+            val sram_data = SRAM[{ty}]({blk})
+            val {sram_acc} = SRAM[Index]({blk})
+            val {sram_merge} = SRAM[{ty}]({blk})
+            sram_data load {data}(i::i+{blk})
+
+            Pipe({blk} by 1) {{ {ii} =>
+                val {i_sym} = (i + {ii}).to[Long]
+                val {e_sym} = sram_data({ii})
+                Sequential {{
+                    {sram_acc}({ii}) = 0.to[Index]
+                    {body_code}
+                }}
+            }}
+
+            Parallel {{
+                {acc}(i::i+{blk}) store {sram_acc}
+                {merge_values}(i::i+{blk}) store {sram_merge}
+            }}
+        }}
+
+        // Compute prefix sums sequentially.
+        // FIXME(zhangwen): is it correct to use Pipe instead of Sequential?
+        // TODO(zhangwen): this is too sequential.
+        val prev = Reg[Index](0.to[Index])
+        Pipe({datalen} by {blk}) {{ i =>
+            val sram_acc = SRAM[Index]({blk})
+            sram_acc load {acc}(i::i+{blk})
+
+            Pipe({blk} by 1) {{ ii =>
+                if (sram_acc(ii) != 0.to[Index]) {{
+                    prev := prev + 1.to[Index]
+                    sram_acc(ii) = prev
+                }}
+            }}
+
+            {acc}(i::i+{blk}) store sram_acc
+        }}
+
+        // Write result to destination DRAM.
+        {result_len} := Reduce(Reg[Index])({datalen} by {blk} par {par}) {{ i =>
+            val temp = FIFO[{ty}]({blk})
+            val sram_acc = SRAM[Index]({blk})
+            val sram_merge = SRAM[{ty}]({blk})
+
+            Parallel {{
+                sram_acc load {acc}(i::i+{blk})
+                sram_merge load {merge_values}(i::i+{blk})
+            }}
+
+            val maxIndex = Reg[Index] // One past the actual max index.
+            maxIndex := 0.to[Index]
+            Pipe({blk} by 1) {{ ii =>
+                val index = sram_acc(ii)
+                if (index != 0) {{
+                    temp.enq(sram_merge(ii))
+                    maxIndex := index
+                }}
+            }}
+
+            val numElems = temp.numel
+            {appender}(maxIndex-numElems::maxIndex) store temp
+            numElems
+        }} {{ _+_ }}
+        ",
+
+        datalen = gen_sym(&data_vec_info.len),
+        blk = BLK_SIZE,
+        par = PAR,
+        ty = elem_type_scala,
+        sram_acc = gen_sym(&sram_acc_sym),
+        sram_merge = gen_sym(&sram_merge_sym),
+        data = gen_sym(&data_sym),
+        ii = gen_sym(&ii_sym),
+        i_sym = gen_sym(&i_sym),
+        e_sym = gen_sym(&e_sym),
+        body_code = body_code,
+        acc = gen_sym(&dram_acc_sym),
+        merge_values = gen_sym(&dram_merge_sym),
+        appender = gen_sym(&appender_sym),
+        result_len = gen_sym(&result_veclen_sym));
+
+    Ok(appender_sym.clone())
     // TODO(zhangwen): implement this.
 }
 
@@ -770,10 +916,8 @@ fn gen_new_vecmerger(vec_sym: &Symbol, elem_ty: &Type, glob_ctx: &mut GlobalCtx,
     let elem_type_scala = gen_scalar_type(elem_ty, format!("Not supported vecmerger type: {}",
                                                            print_type(elem_ty)))?;
     let vecmerger_sym = glob_ctx.add_variable();
-    let veclen_sym = local_ctx.get_veclen_sym(vec_sym, glob_ctx);
-    glob_ctx.additional_init.add(format!("val {} = DRAM[{}]({})",
-              gen_sym(&vecmerger_sym), elem_type_scala, gen_sym(&veclen_sym)));
-    local_ctx.set_veclen_sym(&vecmerger_sym, &veclen_sym);
+    let vec_info = local_ctx.duplicate_vec_info(&vec_sym, &vecmerger_sym);
+    glob_ctx.add_dram(&vecmerger_sym, &elem_type_scala, &vec_info.len_bound);
 
     // Copy from `vec_sym` to `vecmerger_sym`.
     // FIXME(zhangwen): do this lazily.
@@ -785,7 +929,7 @@ fn gen_new_vecmerger(vec_sym: &Symbol, elem_ty: &Type, glob_ctx: &mut GlobalCtx,
             {vecmerger}(i::i+{blk}) store ss
         }} // Pipe",
 
-        veclen      = gen_sym(&veclen_sym),
+        veclen      = gen_sym(&vec_info.len),
         blk         = BLK_SIZE,
         ty          = elem_type_scala,
         vec         = gen_sym(&vec_sym),

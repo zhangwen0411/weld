@@ -4,7 +4,7 @@ import org.virtualized._
 object MergerConditional extends SpatialApp {
   import IR._
 
-  // |v: vec[i32]| result(for(v, merger[i32,+], |b, i, e| if(e>0, merge(b, e), merge(b, -e))))
+  //w |v: vec[i32]| result(for(v, merger[i32,+], |b, i, e| if(e>0, merge(b, e), merge(b, -e))))
   @virtualize
   def spatialProg(param_v_0: Array[Int]) = {
     val tmp_0 = ArgIn[Index]
@@ -24,6 +24,7 @@ object MergerConditional extends SpatialApp {
         Reduce(Reg[Int])(16 by 1){ ii =>
           val i_0 = (i + ii).to[Long]
           val e_0 = tmp_3(ii)
+
           val b_0 = 0.to[Int]
           val tmp_4 = 0.to[Int]
           val tmp_5 = e_0 > tmp_4
