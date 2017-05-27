@@ -30,6 +30,8 @@ use weld::spatial::ast_to_spatial;
 use weld::util::load_runtime_library;
 use weld::util::MERGER_BC;
 
+use weld::transforms;
+
 enum ReplCommands {
     LoadFile,
 }
@@ -209,6 +211,12 @@ fn main() {
         let mut expr = expr.unwrap();
         println!("After macro substitution:\n{}\n", print_expr(&expr));
 
+        if let Err(ref e) = transforms::uniquify(&mut expr) {
+            println!("Error during uniquify: {}\n", e);
+            continue;
+        }
+        println!("After uniquify:\n{}\n", print_expr(&expr));
+
         if let Err(ref e) = infer_types(&mut expr) {
             println!("Error during type inference: {}\n", e);
             println!("Partially inferred types:\n{}\n", print_typed_expr(&expr));
@@ -219,19 +227,25 @@ fn main() {
 
         let mut expr = expr.to_typed().unwrap();
 
-        let passes: Vec<&Pass> = vec![
-            OPTIMIZATION_PASSES.get("inline-apply").unwrap(),
-            OPTIMIZATION_PASSES.get("inline-let").unwrap(),
-            OPTIMIZATION_PASSES.get("inline-zip").unwrap(),
-            OPTIMIZATION_PASSES.get("loop-fusion").unwrap(),
-            OPTIMIZATION_PASSES.get("uniquify").unwrap()
-        ];
+        let passes: Vec<&Pass> = vec![OPTIMIZATION_PASSES.get("inline-apply").unwrap(),
+                                      OPTIMIZATION_PASSES.get("inline-let").unwrap(),
+                                      OPTIMIZATION_PASSES.get("inline-zip").unwrap(),
+                                      OPTIMIZATION_PASSES.get("loop-fusion").unwrap()];
 
         for i in 0..passes.len() {
+            println!("Applying pass {}", passes[i].pass_name());
             passes[i].transform(&mut expr).unwrap();
-            println!("After {} pass:\n{}\n", passes[i].pass_name(), print_expr(&expr));
+            println!("After {} pass:\n{}\n",
+                     passes[i].pass_name(),
+                     print_expr(&expr));
         }
 
+        if let Err(ref e) = transforms::uniquify(&mut expr) {
+            println!("Error during uniquify: {}\n", e);
+            continue;
+        }
+
+        println!("final program : {}", print_typed_expr(&expr));
         println!("final program raw: {:?}", expr);
 
         match backend {
