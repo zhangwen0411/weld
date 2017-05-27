@@ -59,7 +59,7 @@ macro_rules! add_code {
 struct VecMergerState {
     sram_sym: Symbol,
     range_start_sym: Symbol,
-    range_size: i32,
+    range_size_sym: Symbol,
 }
 
 #[derive(Clone)]
@@ -147,11 +147,11 @@ impl LocalCtx {
     }
 
     pub fn set_vecmerger_state(&mut self, vecmerger_sym: &Symbol, sram_sym: &Symbol,
-                               range_start_sym: &Symbol, range_size: i32) {
+                               range_start_sym: &Symbol, range_size_sym: &Symbol) {
         self.vecmergers.insert(vecmerger_sym.clone(), VecMergerState {
             sram_sym: sram_sym.clone(),
             range_start_sym: range_start_sym.clone(),
-            range_size: range_size,
+            range_size_sym: range_size_sym.clone(),
         });
     }
 
@@ -514,7 +514,7 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                                   offset        = offset_sym_name,
                                   index         = gen_sym(index_sym),
                                   start         = gen_sym(&vecmerger_state.range_start_sym),
-                                  range_size    = vecmerger_state.range_size,
+                                  range_size    = gen_sym(&vecmerger_state.range_size_sym),
                                   sram          = gen_sym(&vecmerger_state.sram_sym),
                                   binop         = binop,
                                   value         = gen_sym(merge_val_sym)
@@ -593,7 +593,7 @@ fn gen_vecmerger_loop(data_sym: &Symbol, data_ty: &Type, dst_ty: &Type, body: &T
                       glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx)
                       -> WeldResult<Symbol> {
     const BLK_SIZE_DST: i32 = 16; // TODO(zhangwen): tunable parameter.
-    const BLK_SIZE_SRC: i32 = 16; // TODO(zhangwen): tunable parameter.
+    const BLK_SIZE_SRC: i32 = 32; // TODO(zhangwen): tunable parameter.
     const PAR: i32 = 4;
     let dst_veclen_sym = &local_ctx.get_vec_info(&dst_sym).len;
 
@@ -604,67 +604,80 @@ fn gen_vecmerger_loop(data_sym: &Symbol, data_ty: &Type, dst_ty: &Type, body: &T
             "Not supported data vec elem type: {}", print_type(data_ty)))?;
     let dst_sram_sym = glob_ctx.add_variable();
     let range_start_sym = glob_ctx.add_variable();
+    let dst_block_size_sym = glob_ctx.add_variable();
     let data_len_sym = &local_ctx.get_vec_info(&data_sym).len;
-    let src_sram_sym = glob_ctx.add_variable();
     let local_dst_sram_sym = glob_ctx.add_variable();
 
     // Generate body code.
     let mut sub_local_ctx = local_ctx.clone();
     sub_local_ctx.set_vecmerger_state(&b_sym, &local_dst_sram_sym,
-                                      &range_start_sym, BLK_SIZE_DST);
+                                      &range_start_sym, &dst_block_size_sym);
     glob_ctx.enter_builder_scope();
     let body_res = gen_expr(body, glob_ctx, &mut sub_local_ctx)?;
     assert_eq!(body_res, *b_sym); // Body should return builder derived from `b`.
     let body_code = glob_ctx.exit_builder_scope();
 
-    // TODO(zhangwen): currently must divide vector size evenly.
+    /*
+     * Here's an illustration for par=4, from the perspective of par_id=2.
+     *
+     *                                working on this block
+     *           /---- round_blk ---\            v
+     *           ---------------------------------------------------------
+     * data_dram |    |    |    |    &    |    |xxxx|    &    |    |  ...
+     *           ---------------------------------------------------------
+     *                     ^         ^         ^
+     *                par_offset     i    i+par_offset
+     *
+     * The blocks in one "round" are processed in parallel before we move on to the next "round".
+     */
+
     // FIXME(zhangwen): doesn't work for, say, multiplication.
     add_code!(glob_ctx, "\
-        assert(({dst_len}+0) % {dst_blk} == 0)
-        // Bring a block of destination DRAM into SRAM.
         Pipe({dst_len} by {dst_blk}) {{ {rs} =>
             val {dst_sram} = SRAM[{ty}]({dst_blk})
-            {dst_sram} load {dst_dram}({rs}::{rs}+{dst_blk})
+            val {dst_block_size} = min({dst_len} - {rs}, {dst_blk}.to[Index])
+            {dst_sram} load {dst_dram}({rs}::{rs}+{dst_block_size})
 
-            assert(({data_len}+0) % {par} == 0)
-            val piece_len = {data_len}/{par}
-            assert(piece_len % {data_blk} == 0)
-            MemFold({dst_sram})({data_len} by piece_len par {par}) {{ i1 =>
+            val round_blk = {data_blk} * {par}
+            MemFold({dst_sram})({par} by 1 par {par}) {{ par_id =>
+                val par_offset = par_id * {data_blk}
                 val {local_dst_sram} = SRAM[{ty}]({dst_blk})
-                Foreach({data_blk} by 1) {{ ii => {local_dst_sram}(ii) = 0 }}
+                Pipe({dst_blk} by 1) {{ ii => {local_dst_sram}(ii) = 0 }}
 
-                Pipe(piece_len by {data_blk}) {{ i2 =>
-                    val base = i1 + i2
-                    val {data_sram} = SRAM[{data_ty}]({data_blk})
-                    {data_sram} load {data_dram}(base::base+{data_blk})
+                Pipe({data_len} by round_blk) {{ i =>
+                    val base = par_offset + i
+                    val data_sram = SRAM[{data_ty}]({data_blk})
+                    val data_block_size =
+                        min(max({data_len} - base, 0.to[Index]), {data_blk}.to[Index])
+                    data_sram load {data_dram}(base::base+data_block_size)
 
-                    Pipe({data_blk} by 1) {{ i3 =>
+                    Pipe(data_block_size by 1) {{ ii =>
                         // TODO(zhangwen): Spatial indices are 32-bit.
-                        val {i_sym} = (base + i3).to[Long]
-                        val {e_sym} = {data_sram}(i3)
+                        val {i_sym} = (base + ii).to[Long]
+                        val {e_sym} = data_sram(ii)
 
                         Sequential {{
                             {body_code}
-                        }}
+                        }}  // Sequential
                     }}  // Pipe
-                }}  // Foreach
+                }}  // Pipe
 
                 {local_dst_sram}
-            }} {{ _{binop}_ }}  // MemReduce
+            }} {{ _{binop}_ }}  // MemFold
 
-            {dst_dram}({rs}::{rs}+{dst_blk}) store {dst_sram}
+            {dst_dram}({rs}::{rs}+{dst_block_size}) store {dst_sram}
         }}  // Pipe",
         dst_len         = gen_sym(&dst_veclen_sym),
         dst_blk         = BLK_SIZE_DST,
         par             = PAR,
         rs              = gen_sym(&range_start_sym),
+        dst_block_size  = gen_sym(&dst_block_size_sym),
         dst_sram        = gen_sym(&dst_sram_sym),
         dst_dram        = gen_sym(&dst_sym),
         ty              = dst_ty_scala,
         data_ty         = data_ty_scala,
         data_len        = gen_sym(&data_len_sym),
         data_blk        = BLK_SIZE_SRC,
-        data_sram       = gen_sym(&src_sram_sym),
         data_dram       = gen_sym(&data_sym),
         local_dst_sram  = gen_sym(&local_dst_sram_sym),
         i_sym           = gen_sym(i_sym),
@@ -680,12 +693,10 @@ fn gen_merger_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
                    b_sym: &Symbol, i_sym: &Symbol, e_sym: &Symbol,
                    glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx) -> WeldResult<Symbol> {
     const BLK_SIZE: i32 = 16; // TODO(zhangwen): tunable parameter.
-    // TODO(zhangwen): currently must divide vector size evenly.
     let veclen_sym = &local_ctx.get_vec_info(&data_sym).len;
     let reduce_res = glob_ctx.add_variable();
     let merger_type_scala = gen_scalar_type(elem_ty, format!(
             "Not supported merger elem type: {}", print_type(elem_ty)))?;
-    let sram_sym = glob_ctx.add_variable();
 
     // Generate code for body.
     glob_ctx.enter_builder_scope();
@@ -698,16 +709,13 @@ fn gen_merger_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
     // TODO(zhangwen): Spatial indices are 32-bit.
     // FIXME(zhangwen): do I need Sequential around body_code?
     add_code!(glob_ctx, "\
-        // The % operator doesn't work on registers; the `+0` is a hack
-        // to make it work.
-        assert(({veclen}+0) % {blk} == 0)
         val {reduce_res} = Reduce(Reg[{ty}])({veclen} by {blk}){{ i =>
-            // Tiling: bring BLK_SIZE elements into SRAM.
-            val {sram} = SRAM[{ty}]({blk})
-            {sram} load {dram}(i::i+{blk})
-            Reduce(Reg[{ty}])({blk} by 1){{ ii =>
+            val block = SRAM[{ty}]({blk})
+            val block_len = min({veclen} - i, {blk}.to[Index])
+            block load {dram}(i::i+block_len)
+            Reduce(Reg[{ty}])(block_len by 1){{ ii =>
                 val {i_sym} = (i + ii).to[Long]
-                val {e_sym} = {sram}(ii)
+                val {e_sym} = block(ii)
 
                 {body_code}
                 {body_res}
@@ -718,7 +726,6 @@ fn gen_merger_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
         blk         = BLK_SIZE,
         reduce_res  = gen_sym(&reduce_res),
         ty          = merger_type_scala,
-        sram        = gen_sym(&sram_sym),
         dram        = gen_sym(data_sym),
         i_sym       = gen_sym(i_sym),
         e_sym       = gen_sym(e_sym),
@@ -755,12 +762,12 @@ fn gen_map_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
 
     const BLK_SIZE: i32 = 16;
     add_code!(glob_ctx, "\
-        assert(({veclen}+0) % {blk} == 0)
         Pipe({veclen} by {blk}) {{ i =>
             val sram_data = SRAM[{ty}]({blk})
             val {sram_dst} = SRAM[{ty}]({blk})
-            sram_data load {data}(i::i+{blk})
-            Pipe({blk} by 1) {{ {ii} =>
+            val block_size = min({veclen} - i, {blk}.to[Index])
+            sram_data load {data}(i::i+block_size)
+            Pipe(block_size by 1) {{ {ii} =>
                 val {i_sym} = (i + {ii}).to[Long]
                 val {e_sym} = sram_data({ii})
 
@@ -768,7 +775,7 @@ fn gen_map_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
                     {body_code}
                 }}
             }}
-            {dst}(i::i+{blk}) store {sram_dst}
+            {dst}(i::i+block_size) store {sram_dst}
         }}",
 
         veclen      = gen_sym(&vec_info.len),
@@ -785,7 +792,6 @@ fn gen_map_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
     Ok(appender_sym.clone())
 }
 
-#[allow(unused_variables)]
 fn gen_filter_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
                    appender_sym: &Symbol, b_sym: &Symbol, i_sym: &Symbol, e_sym: &Symbol,
                    glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx) -> WeldResult<Symbol> {
@@ -824,14 +830,14 @@ fn gen_filter_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
     const PAR: i32 = 4;
     add_code!(glob_ctx, "\
         // Compute condition on each element.
-        assert(({datalen}+0) % {blk} == 0)
         Pipe({datalen} by {blk} par {par}) {{ i =>
             val sram_data = SRAM[{ty}]({blk})
             val {sram_acc} = SRAM[Index]({blk})
             val {sram_merge} = SRAM[{ty}]({blk})
-            sram_data load {data}(i::i+{blk})
+            val block_len = min({datalen} - i, {blk}.to[Index])
+            sram_data load {data}(i::i+block_len)
 
-            Pipe({blk} by 1) {{ {ii} =>
+            Pipe(block_len by 1) {{ {ii} =>
                 val {i_sym} = (i + {ii}).to[Long]
                 val {e_sym} = sram_data({ii})
                 Sequential {{
@@ -841,8 +847,8 @@ fn gen_filter_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
             }}
 
             Parallel {{
-                {acc}(i::i+{blk}) store {sram_acc}
-                {merge_values}(i::i+{blk}) store {sram_merge}
+                {acc}(i::i+block_len) store {sram_acc}
+                {merge_vals}(i::i+block_len) store {sram_merge}
             }}
         }}
 
@@ -850,18 +856,19 @@ fn gen_filter_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
         // FIXME(zhangwen): is it correct to use Pipe instead of Sequential?
         // TODO(zhangwen): this is too sequential.
         val prev = Reg[Index](0.to[Index])
-        Pipe({datalen} by {blk}) {{ i =>
+        Sequential({datalen} by {blk}) {{ i =>
             val sram_acc = SRAM[Index]({blk})
-            sram_acc load {acc}(i::i+{blk})
+            val block_len = min({datalen} - i, {blk}.to[Index])
+            sram_acc load {acc}(i::i+block_len)
 
-            Pipe({blk} by 1) {{ ii =>
+            Pipe(block_len by 1) {{ ii =>
                 if (sram_acc(ii) != 0.to[Index]) {{
                     prev := prev + 1.to[Index]
                     sram_acc(ii) = prev
                 }}
             }}
 
-            {acc}(i::i+{blk}) store sram_acc
+            {acc}(i::i+block_len) store sram_acc
         }}
 
         // Write result to destination DRAM.
@@ -870,14 +877,15 @@ fn gen_filter_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
             val sram_acc = SRAM[Index]({blk})
             val sram_merge = SRAM[{ty}]({blk})
 
+            val block_len = min({datalen} - i, {blk}.to[Index])
             Parallel {{
-                sram_acc load {acc}(i::i+{blk})
-                sram_merge load {merge_values}(i::i+{blk})
+                sram_acc load {acc}(i::i+block_len)
+                sram_merge load {merge_vals}(i::i+block_len)
             }}
 
             val maxIndex = Reg[Index] // One past the actual max index.
             maxIndex := 0.to[Index]
-            Pipe({blk} by 1) {{ ii =>
+            Pipe(block_len by 1) {{ ii =>
                 val index = sram_acc(ii)
                 if (index != 0) {{
                     temp.enq(sram_merge(ii))
@@ -891,24 +899,23 @@ fn gen_filter_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
         }} {{ _+_ }}
         ",
 
-        datalen = gen_sym(&data_vec_info.len),
-        blk = BLK_SIZE,
-        par = PAR,
-        ty = elem_type_scala,
-        sram_acc = gen_sym(&sram_acc_sym),
-        sram_merge = gen_sym(&sram_merge_sym),
-        data = gen_sym(&data_sym),
-        ii = gen_sym(&ii_sym),
-        i_sym = gen_sym(&i_sym),
-        e_sym = gen_sym(&e_sym),
-        body_code = body_code,
-        acc = gen_sym(&dram_acc_sym),
-        merge_values = gen_sym(&dram_merge_sym),
-        appender = gen_sym(&appender_sym),
-        result_len = gen_sym(&result_veclen_sym));
+        datalen     = gen_sym(&data_vec_info.len),
+        blk         = BLK_SIZE,
+        par         = PAR,
+        ty          = elem_type_scala,
+        sram_acc    = gen_sym(&sram_acc_sym),
+        sram_merge  = gen_sym(&sram_merge_sym),
+        data        = gen_sym(&data_sym),
+        ii          = gen_sym(&ii_sym),
+        i_sym       = gen_sym(&i_sym),
+        e_sym       = gen_sym(&e_sym),
+        body_code   = body_code,
+        acc         = gen_sym(&dram_acc_sym),
+        merge_vals  = gen_sym(&dram_merge_sym),
+        appender    = gen_sym(&appender_sym),
+        result_len  = gen_sym(&result_veclen_sym));
 
     Ok(appender_sym.clone())
-    // TODO(zhangwen): implement this.
 }
 
 fn gen_new_vecmerger(vec_sym: &Symbol, elem_ty: &Type, glob_ctx: &mut GlobalCtx,
