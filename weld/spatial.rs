@@ -56,10 +56,10 @@ macro_rules! add_code {
 }
 
 #[derive(Clone)]
-struct VecMergerState {
-    sram_sym: Symbol,
-    range_start_sym: Symbol,
-    range_size_sym: Symbol,
+struct VecMergerState<'a> {
+    sram_sym: &'a Symbol,
+    range_start_sym: &'a Symbol,
+    range_size_sym: &'a Symbol,
 }
 
 #[derive(Clone)]
@@ -69,14 +69,14 @@ struct VectorInfo {
 }
 
 #[derive(Clone, PartialEq)]
-enum AppenderState {
+enum AppenderState<'a> {
     Fresh, // Hasn't been used
-    Map { sram_sym: Symbol, ii_sym: Symbol }, // Is being used in a map operation
+    Map { sram_sym: &'a Symbol, ii_sym: &'a Symbol }, // Is being used in a map operation
 
     // Is being used in a filter operation.
     // Here "filter" just means "at most one append for every element"; the value appended
     // can be different from the original value.
-    Filter { fifo_sym: Symbol },
+    Filter { fifo_sym: &'a Symbol },
 
     Dead, // Can no longer be used
     // For now there's no invalid state because an unsupported operation terminates compilation.
@@ -112,15 +112,15 @@ impl AppenderUsage {
 }
 
 #[derive(Clone)]
-struct LocalCtx {
+struct LocalCtx<'a> {
     vectors: HashMap<Symbol, VectorInfo>,
-    vecmergers: HashMap<Symbol, VecMergerState>,
-    pub appenders: HashMap<Symbol, AppenderState>,
+    pub vecmergers: HashMap<Symbol, VecMergerState<'a>>,
+    pub appenders: HashMap<Symbol, AppenderState<'a>>,
     pub structs: HashMap<Symbol, Box<Vec<Symbol>>>, // symbol for struct value => components
 }
 
-impl LocalCtx {
-    pub fn new() -> LocalCtx {
+impl<'a> LocalCtx<'a> {
+    pub fn new() -> LocalCtx<'a> {
         LocalCtx {
             vectors: HashMap::new(),
             vecmergers: HashMap::new(),
@@ -144,19 +144,6 @@ impl LocalCtx {
         let vec_info = self.vectors.get(vec).unwrap().clone();
         self.vectors.insert(new_vec.clone(), vec_info.clone());
         vec_info
-    }
-
-    pub fn set_vecmerger_state(&mut self, vecmerger_sym: &Symbol, sram_sym: &Symbol,
-                               range_start_sym: &Symbol, range_size_sym: &Symbol) {
-        self.vecmergers.insert(vecmerger_sym.clone(), VecMergerState {
-            sram_sym: sram_sym.clone(),
-            range_start_sym: range_start_sym.clone(),
-            range_size_sym: range_size_sym.clone(),
-        });
-    }
-
-    pub fn get_vecmerger_state(&self, vecmerger_sym: &Symbol) -> Option<VecMergerState> {
-        self.vecmergers.get(vecmerger_sym).map(VecMergerState::clone)
     }
 }
 
@@ -368,9 +355,9 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                             {on_false_code}
                         }}",
 
-                        cond=gen_sym(&cond_sym),
-                        on_true_code=on_true_code,
-                        on_false_code=on_false_code);
+                        cond = gen_sym(&cond_sym),
+                        on_true_code = on_true_code,
+                        on_false_code = on_false_code);
 
                     Ok(on_true_sym)
                 }
@@ -411,16 +398,17 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                 let ref i_sym = params[1].name;
                 let ref e_sym = params[2].name;
 
+                use ast::BuilderKind::*;
                 match *builder_kind {
-                    BuilderKind::Merger(ref elem_ty, binop) =>
+                    Merger(ref elem_ty, binop) =>
                         gen_merger_loop(&data_res, elem_ty, body, &builder_sym, binop,
                                         b_sym, i_sym, e_sym, glob_ctx, local_ctx),
 
-                    BuilderKind::VecMerger(ref elem_ty, binop) =>
+                    VecMerger(ref elem_ty, binop) =>
                         gen_vecmerger_loop(&data_res, data_ty, elem_ty, body, &builder_sym, binop,
                                            b_sym, i_sym, e_sym, glob_ctx, local_ctx),
 
-                    BuilderKind::Appender(ref elem_ty) => {
+                    Appender(ref elem_ty) => {
                         // Prohibit the appender from being used again.
                         let old_state = local_ctx.appenders.insert(builder_sym.clone(),
                                                                    AppenderState::Dead).unwrap();
@@ -457,17 +445,17 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
 
         ExprKind::NewBuilder(ref builder_expr) => {
             if let Type::Builder(ref kind) = expr.ty {
+                use ast::BuilderKind::*;
                 match *kind {
-                    BuilderKind::Merger(ref elem_ty, _) =>
-                        gen_new_merger(elem_ty, glob_ctx, None),
+                    Merger(ref elem_ty, _) => gen_new_merger(elem_ty, glob_ctx, None),
 
-                    BuilderKind::VecMerger(ref elem_ty, _) => {
+                    VecMerger(ref elem_ty, _) => {
                         let vec_sym = gen_expr(builder_expr.as_ref().unwrap(),
                                                glob_ctx, local_ctx)?;
                         gen_new_vecmerger(&vec_sym, elem_ty, glob_ctx, local_ctx)
                     }
 
-                    BuilderKind::Appender(_) => gen_new_appender(glob_ctx, local_ctx),
+                    Appender(_) => gen_new_appender(glob_ctx, local_ctx),
 
                     _ => weld_err!("NewBuilder: builder kind not supported: {}", print_expr(expr))
                 }
@@ -481,63 +469,63 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
             let value_res = gen_expr(value, glob_ctx, local_ctx)?;
 
             if let Type::Builder(ref kind) = builder.ty {
+                use ast::BuilderKind::*;
                 match *kind {
-                    BuilderKind::Merger(_, binop) => {
+                    Merger(_, binop) => {
                         let res_sym = glob_ctx.add_variable();
                         add_code!(glob_ctx, "val {new_val} = {old_val} {op} {value}",
-                              new_val=gen_sym(&res_sym),
-                              old_val=gen_sym(&builder_sym),
-                              op=binop,
-                              value=gen_sym(&value_res));
+                                  new_val = gen_sym(&res_sym),
+                                  old_val = gen_sym(&builder_sym),
+                                  op = binop,
+                                  value = gen_sym(&value_res));
                         Ok(res_sym)
                     }
 
-                    BuilderKind::VecMerger(_, binop) => {
-                        let vecmerger_state = match local_ctx.get_vecmerger_state(&builder_sym) {
-                            Some(state) => state,
-                            None =>
-                                weld_err!("Not supported: vecmerger merge {}", print_expr(expr))?
-                        };
-                        let values = local_ctx.structs.get(&value_res).unwrap();
-                        let ref index_sym = values[0];
-                        let ref merge_val_sym = values[1];
+                    VecMerger(_, binop) =>
+                        if let Some(vecmerger_state) = local_ctx.vecmergers.get(&builder_sym) {
+                            let values = local_ctx.structs.get(&value_res).unwrap();
+                            let ref index_sym = values[0];
+                            let ref merge_val_sym = values[1];
 
-                        // If the index is in range, merge the value.
-                        let offset_sym = glob_ctx.add_variable();
-                        let offset_sym_name = gen_sym(&offset_sym);
-                        // TODO(zhangwen): will break if index overflows 32-bit int.
-                        add_code!(glob_ctx, "\
-                                  val {offset} = {index}.to[Index] - {start}
-                                  if ({offset} >= 0 && {offset} < {range_size}) {{
-                                      {sram}({offset}) = {sram}({offset}) {binop} {value}
-                                  }}",
-                                  offset        = offset_sym_name,
-                                  index         = gen_sym(index_sym),
-                                  start         = gen_sym(&vecmerger_state.range_start_sym),
-                                  range_size    = gen_sym(&vecmerger_state.range_size_sym),
-                                  sram          = gen_sym(&vecmerger_state.sram_sym),
-                                  binop         = binop,
-                                  value         = gen_sym(merge_val_sym)
-                        );
-                        Ok(builder_sym)
-                    }
+                            // If the index is in range, merge the value.
+                            let offset_sym = glob_ctx.add_variable();
+                            let offset_sym_name = gen_sym(&offset_sym);
+                            // TODO(zhangwen): will break if index overflows 32-bit int.
+                            add_code!(glob_ctx, "\
+                                val {offset} = {index}.to[Index] - {start}
+                                if ({offset} >= 0 && {offset} < {range_size}) {{
+                                    {sram}({offset}) = {sram}({offset}) {binop} {value}
+                                }}",
 
-                    BuilderKind::Appender(_) => {
+                                offset = offset_sym_name,
+                                index = gen_sym(index_sym),
+                                start = gen_sym(&vecmerger_state.range_start_sym),
+                                range_size = gen_sym(&vecmerger_state.range_size_sym),
+                                sram = gen_sym(&vecmerger_state.sram_sym),
+                                binop = binop,
+                                value = gen_sym(merge_val_sym)
+                            );
+                            Ok(builder_sym)
+                        } else {
+                            weld_err!("Not supported: vecmerger merge {}", print_expr(expr))
+                        },
+
+                    Appender(_) => {
                         use self::AppenderState::*;
                         let appender_state = local_ctx.appenders.get(&builder_sym).unwrap();
                         match *appender_state {
                             Map { ref sram_sym, ref ii_sym } => {
                                 add_code!(glob_ctx, "{sram}({ii}) = {value}",
-                                          sram=gen_sym(&sram_sym),
-                                          ii=gen_sym(&ii_sym),
-                                          value=gen_sym(&value_res));
+                                          sram = gen_sym(&sram_sym),
+                                          ii = gen_sym(&ii_sym),
+                                          value = gen_sym(&value_res));
                                 Ok(builder_sym)
                             }
 
                             Filter { ref fifo_sym } => {
                                 add_code!(glob_ctx, "{fifo}.enq({value})",
-                                          fifo=gen_sym(&fifo_sym),
-                                          value=gen_sym(&value_res));
+                                          fifo = gen_sym(&fifo_sym),
+                                          value = gen_sym(&value_res));
                                 Ok(builder_sym)
                             }
 
@@ -555,10 +543,9 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
         ExprKind::Res { ref builder } => {
             if let Type::Builder(ref kind) = builder.ty {
                 let builder_sym = gen_expr(builder, glob_ctx, local_ctx)?;
+                use ast::BuilderKind::*;
                 match *kind {
-                    BuilderKind::Merger(_, _) => Ok(builder_sym),
-                    BuilderKind::VecMerger(_, _) => Ok(builder_sym),
-                    BuilderKind::Appender(_) => Ok(builder_sym),
+                    Merger(_, _) | VecMerger(_, _) | Appender(_) => Ok(builder_sym),
                     _ => weld_err!("Res: builder kind not supported: {}", print_expr(expr)),
                 }
             } else {
@@ -586,8 +573,7 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
 fn gen_vecmerger_loop(data_sym: &Symbol, data_ty: &Type, dst_ty: &Type, body: &TypedExpr,
                       dst_sym: &Symbol, binop: BinOpKind,
                       b_sym: &Symbol, i_sym: &Symbol, e_sym: &Symbol,
-                      glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx)
-                      -> WeldResult<Symbol> {
+                      glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx) -> WeldResult<Symbol> {
     const BLK_SIZE_DST: i32 = 16; // TODO(zhangwen): tunable parameter.
     const BLK_SIZE_SRC: i32 = 32; // TODO(zhangwen): tunable parameter.
     const PAR: i32 = 4;
@@ -606,8 +592,9 @@ fn gen_vecmerger_loop(data_sym: &Symbol, data_ty: &Type, dst_ty: &Type, body: &T
 
     // Generate body code.
     let mut sub_local_ctx = local_ctx.clone();
-    sub_local_ctx.set_vecmerger_state(&b_sym, &local_dst_sram_sym,
-                                      &range_start_sym, &dst_block_size_sym);
+    sub_local_ctx.vecmergers.insert(b_sym.clone(),
+        VecMergerState { sram_sym: &local_dst_sram_sym, range_start_sym: &range_start_sym,
+                         range_size_sym: &dst_block_size_sym });
     glob_ctx.enter_builder_scope();
     let body_res = gen_expr(body, glob_ctx, &mut sub_local_ctx)?;
     assert_eq!(body_res, *b_sym); // Body should return builder derived from `b`.
@@ -663,23 +650,24 @@ fn gen_vecmerger_loop(data_sym: &Symbol, data_ty: &Type, dst_ty: &Type, body: &T
 
             {dst_dram}({rs}::{rs}+{dst_block_size}) store {dst_sram}
         }}  // Pipe",
-        dst_len         = gen_sym(&dst_veclen_sym),
-        dst_blk         = BLK_SIZE_DST,
-        par             = PAR,
-        rs              = gen_sym(&range_start_sym),
-        dst_block_size  = gen_sym(&dst_block_size_sym),
-        dst_sram        = gen_sym(&dst_sram_sym),
-        dst_dram        = gen_sym(&dst_sym),
-        ty              = dst_ty_scala,
-        data_ty         = data_ty_scala,
-        data_len        = gen_sym(&data_len_sym),
-        data_blk        = BLK_SIZE_SRC,
-        data_dram       = gen_sym(&data_sym),
-        local_dst_sram  = gen_sym(&local_dst_sram_sym),
-        i_sym           = gen_sym(i_sym),
-        e_sym           = gen_sym(e_sym),
-        body_code       = body_code,
-        binop           = binop);
+
+        dst_len = gen_sym(&dst_veclen_sym),
+        dst_blk = BLK_SIZE_DST,
+        par = PAR,
+        rs = gen_sym(&range_start_sym),
+        dst_block_size = gen_sym(&dst_block_size_sym),
+        dst_sram = gen_sym(&dst_sram_sym),
+        dst_dram = gen_sym(&dst_sym),
+        ty = dst_ty_scala,
+        data_ty = data_ty_scala,
+        data_len = gen_sym(&data_len_sym),
+        data_blk = BLK_SIZE_SRC,
+        data_dram = gen_sym(&data_sym),
+        local_dst_sram = gen_sym(&local_dst_sram_sym),
+        i_sym = gen_sym(i_sym),
+        e_sym = gen_sym(e_sym),
+        body_code = body_code,
+        binop = binop);
 
     Ok(dst_sym.clone())
 }
@@ -718,21 +706,20 @@ fn gen_merger_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
             }} {{ _{binop}_ }}  // Reduce
         }} {{ _{binop}_ }} {binop} {init_value}  // Reduce",
 
-        veclen      = gen_sym(&veclen_sym),
-        blk         = BLK_SIZE,
-        reduce_res  = gen_sym(&reduce_res),
-        ty          = merger_type_scala,
-        dram        = gen_sym(data_sym),
-        i_sym       = gen_sym(i_sym),
-        e_sym       = gen_sym(e_sym),
-        body_code   = body_code,
-        body_res    = gen_sym(&body_res),
-        binop       = binop,
-        init_value  = gen_sym(&merger_sym));
+        veclen = gen_sym(&veclen_sym),
+        blk = BLK_SIZE,
+        reduce_res = gen_sym(&reduce_res),
+        ty = merger_type_scala,
+        dram = gen_sym(data_sym),
+        i_sym = gen_sym(i_sym),
+        e_sym = gen_sym(e_sym),
+        body_code = body_code,
+        body_res = gen_sym(&body_res),
+        binop = binop,
+        init_value = gen_sym(&merger_sym));
 
     Ok(reduce_res)
 }
-
 
 fn gen_map_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
                 appender_sym: &Symbol, b_sym: &Symbol, i_sym: &Symbol, e_sym: &Symbol,
@@ -749,8 +736,7 @@ fn gen_map_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
     // Generate body code.
     let mut sub_local_ctx = local_ctx.clone();
     sub_local_ctx.appenders.insert(
-        b_sym.clone(),
-        AppenderState::Map { sram_sym: sram_dst_sym.clone(), ii_sym: ii_sym.clone() });
+        b_sym.clone(), AppenderState::Map { sram_sym: &sram_dst_sym, ii_sym: &ii_sym });
     glob_ctx.enter_builder_scope();
     let body_res = gen_expr(body, glob_ctx, &mut sub_local_ctx)?;
     assert_eq!(body_res, *b_sym); // Body should return builder derived from `b`.
@@ -774,16 +760,16 @@ fn gen_map_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
             {dst}(i::i+block_size) store {sram_dst}
         }}",
 
-        veclen      = gen_sym(&vec_info.len),
-        blk         = BLK_SIZE,
-        ty          = elem_type_scala,
-        sram_dst    = gen_sym(&sram_dst_sym),
-        data        = gen_sym(&data_sym),
-        ii          = gen_sym(&ii_sym),
-        i_sym       = gen_sym(&i_sym),
-        e_sym       = gen_sym(&e_sym),
-        body_code   = body_code,
-        dst         = gen_sym(&appender_sym));
+        veclen = gen_sym(&vec_info.len),
+        blk = BLK_SIZE,
+        ty = elem_type_scala,
+        sram_dst = gen_sym(&sram_dst_sym),
+        data = gen_sym(&data_sym),
+        ii = gen_sym(&ii_sym),
+        i_sym = gen_sym(&i_sym),
+        e_sym = gen_sym(&e_sym),
+        body_code = body_code,
+        dst = gen_sym(&appender_sym));
 
     Ok(appender_sym.clone())
 }
@@ -808,16 +794,15 @@ fn gen_filter_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
     // FIXME(zhangwen): can't use design space exploration on PAR this way...
     add_code!(glob_ctx, "\
         val round_blk = {blk} * {par}
-        Sequential({data_len} by round_blk) {{ i =>
-        ",
-        blk=BLK_SIZE, par=PAR, data_len=gen_sym(&data_len));
+        Sequential({data_len} by round_blk) {{ i =>",
+        blk = BLK_SIZE, par = PAR, data_len = gen_sym(&data_len));
 
     // Make `PAR` local FIFOs.
     let mut fifo_syms = Vec::new();
     for _ in 0..PAR {
         let fifo_sym = glob_ctx.add_variable();
         add_code!(glob_ctx, "val {fifo} = FIFO[{ty}]({blk})",
-                  fifo=gen_sym(&fifo_sym), ty=elem_type_scala, blk=BLK_SIZE);
+                  fifo = gen_sym(&fifo_sym), ty = elem_type_scala, blk = BLK_SIZE);
         fifo_syms.push(fifo_sym);
     }
     let fifo_syms = fifo_syms;
@@ -828,8 +813,8 @@ fn gen_filter_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
         // Generate body code.
         // FIXME(zhangwen): shouldn't need to generate body code `PAR` times...
         let mut sub_local_ctx = local_ctx.clone();
-        sub_local_ctx.appenders.insert(b_sym.clone(),
-                                       AppenderState::Filter { fifo_sym: fifo_sym.clone() });
+        sub_local_ctx.appenders.insert(
+            b_sym.clone(), AppenderState::Filter { fifo_sym: &fifo_sym });
         glob_ctx.enter_builder_scope();
         let body_res = gen_expr(body, glob_ctx, &mut sub_local_ctx)?;
         assert_eq!(body_res, *b_sym); // Body should return builder derived from `b`.
@@ -853,14 +838,14 @@ fn gen_filter_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
         }}  // #{par_id}
         ",
 
-        par_id      = par_id,
-        blk         = BLK_SIZE,
-        data_len    = gen_sym(&data_len),
-        ty          = elem_type_scala,
-        data        = gen_sym(&data_sym),
-        i_sym       = gen_sym(&i_sym),
-        e_sym       = gen_sym(&e_sym),
-        body_code   = body_code);
+        par_id = par_id,
+        blk = BLK_SIZE,
+        data_len = gen_sym(&data_len),
+        ty = elem_type_scala,
+        data = gen_sym(&data_sym),
+        i_sym = gen_sym(&i_sym),
+        e_sym = gen_sym(&e_sym),
+        body_code = body_code);
     }
     add_code!(glob_ctx, "}}  // Parallel");
 
@@ -882,17 +867,17 @@ fn gen_filter_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
     for (fifo_sym, count_sym) in fifo_syms.iter().zip(count_syms.iter()) {
         add_code!(glob_ctx, "\
                   {appender}({result_len}+{end}-{fifo}.numel::{result_len}+{end}) store {fifo}",
-                  appender      = gen_sym(&appender_sym),
-                  result_len    = gen_sym(&result_veclen_sym),
-                  end           = gen_sym(&count_sym),
-                  fifo          = gen_sym(&fifo_sym));
+                  appender = gen_sym(&appender_sym),
+                  result_len = gen_sym(&result_veclen_sym),
+                  end = gen_sym(&count_sym),
+                  fifo = gen_sym(&fifo_sym));
     }
     add_code!(glob_ctx, "}}  // Parallel");
 
     // Update number of elements so far (i.e., output length).
     add_code!(glob_ctx, "{result_len} := {result_len} + {round_count}",
-              result_len=gen_sym(&result_veclen_sym),
-              round_count=gen_sym(&count_syms.last().unwrap()));
+              result_len = gen_sym(&result_veclen_sym),
+              round_count = gen_sym(&count_syms.last().unwrap()));
 
     add_code!(glob_ctx, "}}  // Sequential");
 
@@ -907,8 +892,7 @@ fn gen_new_vecmerger(vec_sym: &Symbol, elem_ty: &Type, glob_ctx: &mut GlobalCtx,
     let vec_info = local_ctx.duplicate_vec_info(&vec_sym, &vecmerger_sym);
     glob_ctx.add_dram(&vecmerger_sym, &elem_type_scala, &vec_info.len_bound);
 
-    // Copy from `vec_sym` to `vecmerger_sym`.
-    // FIXME(zhangwen): do this lazily.
+    // Copy from `vec_sym` to `vecmerger_sym`. Could do this lazily, but probably not worth it.
     const BLK_SIZE: i32 = 16; // TODO(zhangwen): tunable parameter.
     add_code!(glob_ctx, "\
         Pipe({veclen} by {blk}) {{ i =>
@@ -917,11 +901,11 @@ fn gen_new_vecmerger(vec_sym: &Symbol, elem_ty: &Type, glob_ctx: &mut GlobalCtx,
             {vecmerger}(i::i+{blk}) store ss
         }} // Pipe",
 
-        veclen      = gen_sym(&vec_info.len),
-        blk         = BLK_SIZE,
-        ty          = elem_type_scala,
-        vec         = gen_sym(&vec_sym),
-        vecmerger   = gen_sym(&vecmerger_sym));
+        veclen = gen_sym(&vec_info.len),
+        blk = BLK_SIZE,
+        ty = elem_type_scala,
+        vec = gen_sym(&vec_sym),
+        vecmerger = gen_sym(&vecmerger_sym));
 
     Ok(vecmerger_sym)
 }
@@ -951,7 +935,8 @@ fn gen_mux(cond_sym: &Symbol, on_true_sym: &Symbol, on_false_sym: &Symbol,
         on_true_sym.clone()
     } else {
         let res_sym = glob_ctx.add_variable();
-        add_code!(glob_ctx, "val {} = mux({}, {}, {})", gen_sym(&res_sym), gen_sym(&cond_sym),
+        add_code!(glob_ctx, "val {} = mux({}, {}, {})",
+                  gen_sym(&res_sym), gen_sym(&cond_sym),
                   gen_sym(&on_true_sym), gen_sym(&on_false_sym));
         res_sym
     }
@@ -978,11 +963,10 @@ fn gen_sym(sym: &Symbol) -> String {
 fn is_spatial_mutable(ty: &Type) -> bool {
     match *ty {
         Type::Builder(ref kind) => {
+            use ast::BuilderKind::*;
             match *kind {
-                BuilderKind::Appender(_) => true,
-                BuilderKind::DictMerger(_, _, _) => true,
-                BuilderKind::VecMerger(_, _) => true,
-                _ => false,
+                Appender(_) | DictMerger(_, _, _) | VecMerger(_, _) => true,
+                Merger(_, _) => false,
             }
         }
 
@@ -1045,8 +1029,11 @@ fn compute_appender_usage(expr: &TypedExpr, appender_sym: &Symbol) -> (AppenderU
                     // In func, b_sym refers to the loop builder.
                     let (func_usage, func_ret) = compute_appender_usage(body, b_sym);
                     assert!(func_ret);  // Function body must return b_sym.
-                    if func_usage != AppenderUsage::Unused { usage = AppenderUsage::Unsupported; }
-                    (usage, true)
+                    if func_usage != AppenderUsage::Unused {
+                        (AppenderUsage::Unsupported, true)
+                    } else {
+                        (usage, true)
+                    }
                 } else {
                     panic!("For loop func is not a lambda")
                 }
