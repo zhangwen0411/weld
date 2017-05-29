@@ -4,7 +4,7 @@ import org.virtualized._
 object AppenderFilterSimple extends SpatialApp {
   import IR._
 
-  //w |v: vec[i32]| result(for(v, appender[i32], |b, i, e| if (e > 42, merge(b, e), b)))
+  //w |v: vec[i32]| result(for(v, appender[i32], |b, i, e| if (e > 42, merge(b, e*e), b)))
   @virtualize
   def spatialProg(param_v_0: Array[Int]) = {
     val tmp_0 = ArgIn[Index]
@@ -13,86 +13,128 @@ object AppenderFilterSimple extends SpatialApp {
     setMem(v_0, param_v_0)
     val len = ArgOut[Index]
     val tmp_1 = DRAM[Int](tmp_0)
-    val tmp_3 = DRAM[Index](tmp_0)
-    val tmp_4 = DRAM[Int](tmp_0)
     Accel {
-      val tmp_2 = Reg[Index]
-      // Compute condition on each element.
-      assert((tmp_0+0) % 16 == 0)
-      Pipe(tmp_0 by 16 par 4) { i =>
-        val sram_data = SRAM[Int](16)
-        val tmp_5 = SRAM[Index](16)
-        val tmp_6 = SRAM[Int](16)
-        sram_data load v_0(i::i+16)
-
-        Pipe(16 by 1) { tmp_7 =>
-          val i_0 = (i + tmp_7).to[Long]
-          val e_0 = sram_data(tmp_7)
-          Sequential {
-            tmp_5(tmp_7) = 0.to[Index]
-            val tmp_8 = 42.to[Int]
-            val tmp_9 = e_0 > tmp_8
-            if (tmp_9) {
-              tmp_5(tmp_7) = 1.to[Index]
-              tmp_6(tmp_7) = e_0
-
-            } else {
-
-            }
-
-          }
-        }
-
+      val tmp_2 = Reg[Index](0.to[Index])
+      val round_blk = 16 * 4
+      Sequential(tmp_0 by round_blk) { i =>
+        val tmp_3 = FIFO[Int](16)
+        val tmp_4 = FIFO[Int](16)
+        val tmp_5 = FIFO[Int](16)
+        val tmp_6 = FIFO[Int](16)
         Parallel {
-          tmp_3(i::i+16) store tmp_5
-          tmp_4(i::i+16) store tmp_6
-        }
-      }
+          {  // #0
+            val base = (i + 0*16).to[Index]
+            val block_len = min(max(tmp_0 - base, 0.to[Index]), 16.to[Index])
+            val sram_data = SRAM[Int](16)
+            sram_data load v_0(base::base+block_len)
 
-      // Compute prefix sums sequentially.
-      // FIXME(zhangwen): is it correct to use Pipe instead of Sequential?
-      // TODO(zhangwen): this is too sequential.
-      val prev = Reg[Index](0.to[Index])
-      Pipe(tmp_0 by 16) { i =>
-        val sram_acc = SRAM[Index](16)
-        sram_acc load tmp_3(i::i+16)
+            Pipe(block_len by 1) { ii =>
+              val i_0 = (base + ii).to[Long]
+              val e_0 = sram_data(ii)
 
-        Pipe(16 by 1) { ii =>
-          if (sram_acc(ii) != 0.to[Index]) {
-            prev := prev + 1.to[Index]
-            sram_acc(ii) = prev
-          }
-        }
+              Sequential {
+                val tmp_7 = 42.to[Int]
+                val tmp_8 = e_0 > tmp_7
+                if (tmp_8) {
+                  val tmp_9 = e_0 * e_0
+                  tmp_3.enq(tmp_9)
 
-        tmp_3(i::i+16) store sram_acc
-      }
+                } else {
 
-      // Write result to destination DRAM.
-      tmp_2 := Reduce(Reg[Index])(tmp_0 by 16 par 4) { i =>
-        val temp = FIFO[Int](16)
-        val sram_acc = SRAM[Index](16)
-        val sram_merge = SRAM[Int](16)
+                }
 
+              }  // Sequential
+            }  // Pipe
+          }  // #0
+
+          {  // #1
+            val base = (i + 1*16).to[Index]
+            val block_len = min(max(tmp_0 - base, 0.to[Index]), 16.to[Index])
+            val sram_data = SRAM[Int](16)
+            sram_data load v_0(base::base+block_len)
+
+            Pipe(block_len by 1) { ii =>
+              val i_0 = (base + ii).to[Long]
+              val e_0 = sram_data(ii)
+
+              Sequential {
+                val tmp_10 = 42.to[Int]
+                val tmp_11 = e_0 > tmp_10
+                if (tmp_11) {
+                  val tmp_12 = e_0 * e_0
+                  tmp_4.enq(tmp_12)
+
+                } else {
+
+                }
+
+              }  // Sequential
+            }  // Pipe
+          }  // #1
+
+          {  // #2
+            val base = (i + 2*16).to[Index]
+            val block_len = min(max(tmp_0 - base, 0.to[Index]), 16.to[Index])
+            val sram_data = SRAM[Int](16)
+            sram_data load v_0(base::base+block_len)
+
+            Pipe(block_len by 1) { ii =>
+              val i_0 = (base + ii).to[Long]
+              val e_0 = sram_data(ii)
+
+              Sequential {
+                val tmp_13 = 42.to[Int]
+                val tmp_14 = e_0 > tmp_13
+                if (tmp_14) {
+                  val tmp_15 = e_0 * e_0
+                  tmp_5.enq(tmp_15)
+
+                } else {
+
+                }
+
+              }  // Sequential
+            }  // Pipe
+          }  // #2
+
+          {  // #3
+            val base = (i + 3*16).to[Index]
+            val block_len = min(max(tmp_0 - base, 0.to[Index]), 16.to[Index])
+            val sram_data = SRAM[Int](16)
+            sram_data load v_0(base::base+block_len)
+
+            Pipe(block_len by 1) { ii =>
+              val i_0 = (base + ii).to[Long]
+              val e_0 = sram_data(ii)
+
+              Sequential {
+                val tmp_16 = 42.to[Int]
+                val tmp_17 = e_0 > tmp_16
+                if (tmp_17) {
+                  val tmp_18 = e_0 * e_0
+                  tmp_6.enq(tmp_18)
+
+                } else {
+
+                }
+
+              }  // Sequential
+            }  // Pipe
+          }  // #3
+
+        }  // Parallel
+        val tmp_19 = tmp_3.numel
+        val tmp_20 = tmp_3.numel+tmp_4.numel
+        val tmp_21 = tmp_3.numel+tmp_4.numel+tmp_5.numel
+        val tmp_22 = tmp_3.numel+tmp_4.numel+tmp_5.numel+tmp_6.numel
         Parallel {
-          sram_acc load tmp_3(i::i+16)
-          sram_merge load tmp_4(i::i+16)
-        }
-
-        val maxIndex = Reg[Index] // One past the actual max index.
-        maxIndex := 0.to[Index]
-        Pipe(16 by 1) { ii =>
-          val index = sram_acc(ii)
-          if (index != 0) {
-            temp.enq(sram_merge(ii))
-            maxIndex := index
-          }
-        }
-
-        val numElems = temp.numel
-        tmp_1(maxIndex-numElems::maxIndex) store temp
-        numElems
-      } { _+_ }
-
+          tmp_1(tmp_2+tmp_19-tmp_3.numel::tmp_2+tmp_19) store tmp_3
+          tmp_1(tmp_2+tmp_20-tmp_4.numel::tmp_2+tmp_20) store tmp_4
+          tmp_1(tmp_2+tmp_21-tmp_5.numel::tmp_2+tmp_21) store tmp_5
+          tmp_1(tmp_2+tmp_22-tmp_6.numel::tmp_2+tmp_22) store tmp_6
+        }  // Parallel
+        tmp_2 := tmp_2 + tmp_22
+      }  // Sequential
       len := tmp_2
     }
     pack(getMem(tmp_1), getArg(len))
@@ -107,11 +149,11 @@ object AppenderFilterSimple extends SpatialApp {
 
   @virtualize
   def main() {
-    val N = 32*32
+    val N = 2053
     val a = Array.tabulate(N){ i => (i % 97) }
     val (resultArr, resultLen) = unpack(spatialProg(a))
 
-    val goldArr = a.filter(x => x > 42)
+    val goldArr = a.filter(x => x > 42).map(x => x * x)
     val cksum = (goldArr.length == resultLen) && (goldArr.zip(resultArr){_ == _}.reduce{_&&_})
 
     printArrayTruncated(resultArr, resultLen, "result:")

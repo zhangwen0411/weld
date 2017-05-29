@@ -14,26 +14,23 @@ object MergerConditional extends SpatialApp {
     val out = ArgOut[Int]
     Accel {
       val tmp_1 = 0.to[Int]
-      // The % operator doesn't work on registers; the `+0` is a hack
-      // to make it work.
-      assert((tmp_0+0) % 16 == 0)
       val tmp_2 = Reduce(Reg[Int])(tmp_0 by 16){ i =>
-        // Tiling: bring BLK_SIZE elements into SRAM.
-        val tmp_3 = SRAM[Int](16)
-        tmp_3 load v_0(i::i+16)
-        Reduce(Reg[Int])(16 by 1){ ii =>
+        val block = SRAM[Int](16)
+        val block_len = min(tmp_0 - i, 16.to[Index])
+        block load v_0(i::i+block_len)
+        Reduce(Reg[Int])(block_len by 1){ ii =>
           val i_0 = (i + ii).to[Long]
-          val e_0 = tmp_3(ii)
+          val e_0 = block(ii)
 
           val b_0 = 0.to[Int]
-          val tmp_4 = 0.to[Int]
-          val tmp_5 = e_0 > tmp_4
-          val tmp_6 = b_0 + e_0
-          val tmp_7 = -e_0
-          val tmp_8 = b_0 + tmp_7
-          val tmp_9 = mux(tmp_5, tmp_6, tmp_8)
+          val tmp_3 = 0.to[Int]
+          val tmp_4 = e_0 > tmp_3
+          val tmp_5 = b_0 + e_0
+          val tmp_6 = -e_0
+          val tmp_7 = b_0 + tmp_6
+          val tmp_8 = mux(tmp_4, tmp_5, tmp_7)
 
-          tmp_9
+          tmp_8
         } { _+_ }  // Reduce
       } { _+_ } + tmp_1  // Reduce
       out := tmp_2

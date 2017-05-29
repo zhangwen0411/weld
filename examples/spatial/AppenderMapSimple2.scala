@@ -14,42 +14,39 @@ object AppenderMapSimple2 extends SpatialApp {
     val len = ArgOut[Index]
     val tmp_1 = DRAM[Int](tmp_0)
     Accel {
-      assert((tmp_0+0) % 16 == 0)
       Pipe(tmp_0 by 16) { i =>
         val sram_data = SRAM[Int](16)
         val tmp_2 = SRAM[Int](16)
-        sram_data load x_0(i::i+16)
-        Pipe(16 by 1) { tmp_3 =>
+        val block_size = min(tmp_0 - i, 16.to[Index])
+        sram_data load x_0(i::i+block_size)
+        Pipe(block_size by 1) { tmp_3 =>
           val i_0 = (i + tmp_3).to[Long]
           val x_1 = sram_data(tmp_3)
 
           Sequential {
             val tmp_4 = 0.to[Int]
-            // The % operator doesn't work on registers; the `+0` is a hack
-            // to make it work.
-            assert((tmp_0+0) % 16 == 0)
             val tmp_5 = Reduce(Reg[Int])(tmp_0 by 16){ i =>
-              // Tiling: bring BLK_SIZE elements into SRAM.
-              val tmp_6 = SRAM[Int](16)
-              tmp_6 load x_0(i::i+16)
-              Reduce(Reg[Int])(16 by 1){ ii =>
+              val block = SRAM[Int](16)
+              val block_len = min(tmp_0 - i, 16.to[Index])
+              block load x_0(i::i+block_len)
+              Reduce(Reg[Int])(block_len by 1){ ii =>
                 val i_1 = (i + ii).to[Long]
-                val e_0 = tmp_6(ii)
+                val e_0 = block(ii)
 
                 val b_1 = 0.to[Int]
-                val tmp_7 = 5.to[Int]
-                val tmp_8 = e_0 + tmp_7
-                val tmp_9 = b_1 + tmp_8
+                val tmp_6 = 5.to[Int]
+                val tmp_7 = e_0 + tmp_6
+                val tmp_8 = b_1 + tmp_7
 
-                tmp_9
+                tmp_8
               } { _+_ }  // Reduce
             } { _+_ } + tmp_4  // Reduce
-            val tmp_10 = x_1 * tmp_5
-            tmp_2(tmp_3) = tmp_10
+            val tmp_9 = x_1 * tmp_5
+            tmp_2(tmp_3) = tmp_9
 
           }
         }
-        tmp_1(i::i+16) store tmp_2
+        tmp_1(i::i+block_size) store tmp_2
       }
       len := tmp_0
     }

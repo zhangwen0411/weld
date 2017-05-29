@@ -18,38 +18,32 @@ object MergerNestedFor extends SpatialApp {
     val out = ArgOut[Int]
     Accel {
       val tmp_2 = 0.to[Int]
-      // The % operator doesn't work on registers; the `+0` is a hack
-      // to make it work.
-      assert((tmp_0+0) % 16 == 0)
       val tmp_3 = Reduce(Reg[Int])(tmp_0 by 16){ i =>
-        // Tiling: bring BLK_SIZE elements into SRAM.
-        val tmp_4 = SRAM[Int](16)
-        tmp_4 load x_0(i::i+16)
-        Reduce(Reg[Int])(16 by 1){ ii =>
+        val block = SRAM[Int](16)
+        val block_len = min(tmp_0 - i, 16.to[Index])
+        block load x_0(i::i+block_len)
+        Reduce(Reg[Int])(block_len by 1){ ii =>
           val i1_0 = (i + ii).to[Long]
-          val e1_0 = tmp_4(ii)
+          val e1_0 = block(ii)
 
           val b1_0 = 0.to[Int]
-          // The % operator doesn't work on registers; the `+0` is a hack
-          // to make it work.
-          assert((tmp_1+0) % 16 == 0)
-          val tmp_5 = Reduce(Reg[Int])(tmp_1 by 16){ i =>
-            // Tiling: bring BLK_SIZE elements into SRAM.
-            val tmp_6 = SRAM[Int](16)
-            tmp_6 load y_0(i::i+16)
-            Reduce(Reg[Int])(16 by 1){ ii =>
+          val tmp_4 = Reduce(Reg[Int])(tmp_1 by 16){ i =>
+            val block = SRAM[Int](16)
+            val block_len = min(tmp_1 - i, 16.to[Index])
+            block load y_0(i::i+block_len)
+            Reduce(Reg[Int])(block_len by 1){ ii =>
               val i2_0 = (i + ii).to[Long]
-              val e2_0 = tmp_6(ii)
+              val e2_0 = block(ii)
 
               val b2_0 = 0.to[Int]
-              val tmp_7 = e1_0 * e2_0
-              val tmp_8 = b2_0 + tmp_7
+              val tmp_5 = e1_0 * e2_0
+              val tmp_6 = b2_0 + tmp_5
 
-              tmp_8
+              tmp_6
             } { _+_ }  // Reduce
           } { _+_ } + b1_0  // Reduce
 
-          tmp_5
+          tmp_4
         } { _+_ }  // Reduce
       } { _+_ } + tmp_2  // Reduce
       out := tmp_3

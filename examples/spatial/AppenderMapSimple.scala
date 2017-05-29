@@ -14,12 +14,12 @@ object AppenderMapSimple extends SpatialApp {
     val len = ArgOut[Index]
     val tmp_1 = DRAM[Int](tmp_0)
     Accel {
-      assert((tmp_0+0) % 16 == 0)
       Pipe(tmp_0 by 16) { i =>
         val sram_data = SRAM[Int](16)
         val tmp_2 = SRAM[Int](16)
-        sram_data load x_0(i::i+16)
-        Pipe(16 by 1) { tmp_3 =>
+        val block_size = min(tmp_0 - i, 16.to[Index])
+        sram_data load x_0(i::i+block_size)
+        Pipe(block_size by 1) { tmp_3 =>
           val i_0 = (i + tmp_3).to[Long]
           val x_1 = sram_data(tmp_3)
 
@@ -30,7 +30,7 @@ object AppenderMapSimple extends SpatialApp {
 
           }
         }
-        tmp_1(i::i+16) store tmp_2
+        tmp_1(i::i+block_size) store tmp_2
       }
       len := tmp_0
     }
