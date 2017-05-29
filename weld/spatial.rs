@@ -74,9 +74,9 @@ enum AppenderState {
     Map { sram_sym: Symbol, ii_sym: Symbol }, // Is being used in a map operation
 
     // Is being used in a filter operation.
-    // Here "filter" just means at "most one append for every element"; the value appended
+    // Here "filter" just means "at most one append for every element"; the value appended
     // can be different from the original value.
-    Filter { sram_acc_sym: Symbol, sram_merge_sym: Symbol, ii_sym: Symbol },
+    Filter { fifo_sym: Symbol },
 
     Dead, // Can no longer be used
     // For now there's no invalid state because an unsupported operation terminates compilation.
@@ -534,13 +534,9 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                                 Ok(builder_sym)
                             }
 
-                            Filter { ref sram_acc_sym, ref sram_merge_sym, ref ii_sym } => {
-                                add_code!(glob_ctx, "\
-                                          {sram_acc}({ii}) = 1.to[Index]
-                                          {sram_value}({ii}) = {value}",
-                                          sram_acc=gen_sym(&sram_acc_sym),
-                                          sram_value=gen_sym(&sram_merge_sym),
-                                          ii=gen_sym(&ii_sym),
+                            Filter { ref fifo_sym } => {
+                                add_code!(glob_ctx, "{fifo}.enq({value})",
+                                          fifo=gen_sym(&fifo_sym),
                                           value=gen_sym(&value_res));
                                 Ok(builder_sym)
                             }
@@ -797,123 +793,108 @@ fn gen_filter_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
                    glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx) -> WeldResult<Symbol> {
     let elem_type_scala = gen_scalar_type(elem_ty, format!("Not supported appender type: {}",
                                                            print_type(elem_ty)))?;
-    // The result of a map operation has the same length as the data.
     let data_vec_info = local_ctx.get_vec_info(&data_sym);
+    let data_len = &data_vec_info.len;
     glob_ctx.add_dram(&appender_sym, &elem_type_scala, &data_vec_info.len_bound);
     let result_veclen_sym = glob_ctx.add_variable();
-    glob_ctx.extra_accel_init.add(format!("val {} = Reg[Index]", gen_sym(&result_veclen_sym)));
+    glob_ctx.extra_accel_init.add(format!("val {} = Reg[Index](0.to[Index])",
+                                           gen_sym(&result_veclen_sym)));
     local_ctx.register_vec(&appender_sym, &result_veclen_sym, &data_vec_info.len_bound);
 
-    let dram_acc_sym = glob_ctx.add_variable(); // Prefix sum.
-    glob_ctx.add_dram(&dram_acc_sym, &"Index".to_string(), &data_vec_info.len_bound);
-    // TODO(zhangwen): this is a lot of extra DRAM...
-    let dram_merge_sym = glob_ctx.add_variable(); // Merge values.
-    glob_ctx.add_dram(&dram_merge_sym, &elem_type_scala, &data_vec_info.len_bound);
+    const BLK_SIZE: usize = 16;
+    const PAR: usize = 4;
 
-    let sram_acc_sym = glob_ctx.add_variable();
-    let sram_merge_sym = glob_ctx.add_variable();
-    let ii_sym = glob_ctx.add_variable();
-
-    // Generate body code.
-    let mut sub_local_ctx = local_ctx.clone();
-    sub_local_ctx.appenders.insert(
-        b_sym.clone(), AppenderState::Filter {
-            sram_acc_sym: sram_acc_sym.clone(),
-            sram_merge_sym: sram_merge_sym.clone(), ii_sym: ii_sym.clone()
-        });
-    glob_ctx.enter_builder_scope();
-    let body_res = gen_expr(body, glob_ctx, &mut sub_local_ctx)?;
-    assert_eq!(body_res, *b_sym); // Body should return builder derived from `b`.
-    let body_code = glob_ctx.exit_builder_scope();
-
-    const BLK_SIZE: i32 = 16;
-    const PAR: i32 = 4;
+    // Manually unroll for parallelism...
+    // FIXME(zhangwen): can't use design space exploration on PAR this way...
     add_code!(glob_ctx, "\
-        // Compute condition on each element.
-        Pipe({datalen} by {blk} par {par}) {{ i =>
+        val round_blk = {blk} * {par}
+        Sequential({data_len} by round_blk) {{ i =>
+        ",
+        blk=BLK_SIZE, par=PAR, data_len=gen_sym(&data_len));
+
+    // Make `PAR` local FIFOs.
+    let mut fifo_syms = Vec::new();
+    for _ in 0..PAR {
+        let fifo_sym = glob_ctx.add_variable();
+        add_code!(glob_ctx, "val {fifo} = FIFO[{ty}]({blk})",
+                  fifo=gen_sym(&fifo_sym), ty=elem_type_scala, blk=BLK_SIZE);
+        fifo_syms.push(fifo_sym);
+    }
+    let fifo_syms = fifo_syms;
+
+    // Evaluate condition on blocks in parallel.
+    add_code!(glob_ctx, "Parallel {{");
+    for (par_id, fifo_sym) in fifo_syms.iter().enumerate() {
+        // Generate body code.
+        // FIXME(zhangwen): shouldn't need to generate body code `PAR` times...
+        let mut sub_local_ctx = local_ctx.clone();
+        sub_local_ctx.appenders.insert(b_sym.clone(),
+                                       AppenderState::Filter { fifo_sym: fifo_sym.clone() });
+        glob_ctx.enter_builder_scope();
+        let body_res = gen_expr(body, glob_ctx, &mut sub_local_ctx)?;
+        assert_eq!(body_res, *b_sym); // Body should return builder derived from `b`.
+        let body_code = glob_ctx.exit_builder_scope();
+
+        add_code!(glob_ctx, "\
+        {{  // #{par_id}
+            val base = (i + {par_id}*{blk}).to[Index]
+            val block_len = min(max({data_len} - base, 0.to[Index]), {blk}.to[Index])
             val sram_data = SRAM[{ty}]({blk})
-            val {sram_acc} = SRAM[Index]({blk})
-            val {sram_merge} = SRAM[{ty}]({blk})
-            val block_len = min({datalen} - i, {blk}.to[Index])
-            sram_data load {data}(i::i+block_len)
+            sram_data load {data}(base::base+block_len)
 
-            Pipe(block_len by 1) {{ {ii} =>
-                val {i_sym} = (i + {ii}).to[Long]
-                val {e_sym} = sram_data({ii})
+            Pipe(block_len by 1) {{ ii =>
+                val {i_sym} = (base + ii).to[Long]
+                val {e_sym} = sram_data(ii)
+
                 Sequential {{
-                    {sram_acc}({ii}) = 0.to[Index]
                     {body_code}
-                }}
-            }}
-
-            Parallel {{
-                {acc}(i::i+block_len) store {sram_acc}
-                {merge_vals}(i::i+block_len) store {sram_merge}
-            }}
-        }}
-
-        // Compute prefix sums sequentially.
-        // FIXME(zhangwen): is it correct to use Pipe instead of Sequential?
-        // TODO(zhangwen): this is too sequential.
-        val prev = Reg[Index](0.to[Index])
-        Sequential({datalen} by {blk}) {{ i =>
-            val sram_acc = SRAM[Index]({blk})
-            val block_len = min({datalen} - i, {blk}.to[Index])
-            sram_acc load {acc}(i::i+block_len)
-
-            Pipe(block_len by 1) {{ ii =>
-                if (sram_acc(ii) != 0.to[Index]) {{
-                    prev := prev + 1.to[Index]
-                    sram_acc(ii) = prev
-                }}
-            }}
-
-            {acc}(i::i+block_len) store sram_acc
-        }}
-
-        // Write result to destination DRAM.
-        {result_len} := Reduce(Reg[Index])({datalen} by {blk} par {par}) {{ i =>
-            val temp = FIFO[{ty}]({blk})
-            val sram_acc = SRAM[Index]({blk})
-            val sram_merge = SRAM[{ty}]({blk})
-
-            val block_len = min({datalen} - i, {blk}.to[Index])
-            Parallel {{
-                sram_acc load {acc}(i::i+block_len)
-                sram_merge load {merge_vals}(i::i+block_len)
-            }}
-
-            val maxIndex = Reg[Index] // One past the actual max index.
-            maxIndex := 0.to[Index]
-            Pipe(block_len by 1) {{ ii =>
-                val index = sram_acc(ii)
-                if (index != 0) {{
-                    temp.enq(sram_merge(ii))
-                    maxIndex := index
-                }}
-            }}
-
-            val numElems = temp.numel
-            {appender}(maxIndex-numElems::maxIndex) store temp
-            numElems
-        }} {{ _+_ }}
+                }}  // Sequential
+            }}  // Pipe
+        }}  // #{par_id}
         ",
 
-        datalen     = gen_sym(&data_vec_info.len),
+        par_id      = par_id,
         blk         = BLK_SIZE,
-        par         = PAR,
+        data_len    = gen_sym(&data_len),
         ty          = elem_type_scala,
-        sram_acc    = gen_sym(&sram_acc_sym),
-        sram_merge  = gen_sym(&sram_merge_sym),
         data        = gen_sym(&data_sym),
-        ii          = gen_sym(&ii_sym),
         i_sym       = gen_sym(&i_sym),
         e_sym       = gen_sym(&e_sym),
-        body_code   = body_code,
-        acc         = gen_sym(&dram_acc_sym),
-        merge_vals  = gen_sym(&dram_merge_sym),
-        appender    = gen_sym(&appender_sym),
-        result_len  = gen_sym(&result_veclen_sym));
+        body_code   = body_code);
+    }
+    add_code!(glob_ctx, "}}  // Parallel");
+
+    // Compute prefix sums.
+    // TODO(zhangwen): smarter prefix sum.
+    let mut count_syms = Vec::new();
+    for par_id in 0usize..PAR {
+        let count_sym = glob_ctx.add_variable();
+        let sum = fifo_syms.iter().take(par_id + 1) // Construct the sum expression.
+                           .map(|s| gen_sym(&s) + ".numel")
+                           .collect::<Vec<_>>().join("+");
+        add_code!(glob_ctx, "val {} = {}", gen_sym(&count_sym), sum);
+        count_syms.push(count_sym);
+    }
+    let count_syms = count_syms;
+
+    // Stuff the elements into the destination DRAM.
+    add_code!(glob_ctx, "Parallel {{");
+    for (fifo_sym, count_sym) in fifo_syms.iter().zip(count_syms.iter()) {
+        add_code!(glob_ctx, "\
+                  {appender}({result_len}+{end}-{fifo}.numel::{result_len}+{end}) store {fifo}",
+                  appender      = gen_sym(&appender_sym),
+                  result_len    = gen_sym(&result_veclen_sym),
+                  end           = gen_sym(&count_sym),
+                  fifo          = gen_sym(&fifo_sym));
+    }
+    add_code!(glob_ctx, "}}  // Parallel");
+
+    // Update number of elements so far (i.e., output length).
+    add_code!(glob_ctx, "{result_len} := {result_len} + {round_count}",
+              result_len=gen_sym(&result_veclen_sym),
+              round_count=gen_sym(&count_syms.last().unwrap()));
+
+    add_code!(glob_ctx, "}}  // Sequential");
 
     Ok(appender_sym.clone())
 }
