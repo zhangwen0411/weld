@@ -25,24 +25,25 @@ object AppenderMapSimple2 extends SpatialApp {
 
           Sequential {
             val tmp_4 = 0.to[Int]
-            val tmp_5 = Reduce(Reg[Int])(tmp_0 by 16){ i =>
-              val block = SRAM[Int](16)
-              val block_len = min(tmp_0 - i, 16.to[Index])
-              block load x_0(i::i+block_len)
+            val tmp_6 = reduceTree(Seq[Index](tmp_0))(min)
+            val tmp_5 = Reduce(Reg[Int])(tmp_6 by 16){ i =>
+              val block_len = min(tmp_6 - i, 16.to[Index])
+              val tmp_7 = SRAM[Int](16)
+              Parallel {
+                tmp_7 load x_0(i::i+block_len)
+              }  // Parallel
               Reduce(Reg[Int])(block_len by 1){ ii =>
                 val i_1 = (i + ii).to[Long]
-                val e_0 = block(ii)
-
+                val e_0 = tmp_7(ii)
                 val b_1 = 0.to[Int]
-                val tmp_6 = 5.to[Int]
-                val tmp_7 = e_0 + tmp_6
-                val tmp_8 = b_1 + tmp_7
-
-                tmp_8
+                val tmp_8 = 5.to[Int]
+                val tmp_9 = e_0 + tmp_8
+                val tmp_10 = b_1 + tmp_9
+                tmp_10
               } { _+_ }  // Reduce
             } { _+_ } + tmp_4  // Reduce
-            val tmp_9 = x_1 * tmp_5
-            tmp_2(tmp_3) = tmp_9
+            val tmp_11 = x_1 * tmp_5
+            tmp_2(tmp_3) = tmp_11
 
           }
         }

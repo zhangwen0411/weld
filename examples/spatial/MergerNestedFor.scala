@@ -18,32 +18,34 @@ object MergerNestedFor extends SpatialApp {
     val out = ArgOut[Int]
     Accel {
       val tmp_2 = 0.to[Int]
-      val tmp_3 = Reduce(Reg[Int])(tmp_0 by 16){ i =>
-        val block = SRAM[Int](16)
-        val block_len = min(tmp_0 - i, 16.to[Index])
-        block load x_0(i::i+block_len)
+      val tmp_4 = reduceTree(Seq[Index](tmp_0))(min)
+      val tmp_3 = Reduce(Reg[Int])(tmp_4 by 16){ i =>
+        val block_len = min(tmp_4 - i, 16.to[Index])
+        val tmp_5 = SRAM[Int](16)
+        Parallel {
+          tmp_5 load x_0(i::i+block_len)
+        }  // Parallel
         Reduce(Reg[Int])(block_len by 1){ ii =>
           val i1_0 = (i + ii).to[Long]
-          val e1_0 = block(ii)
-
+          val e1_0 = tmp_5(ii)
           val b1_0 = 0.to[Int]
-          val tmp_4 = Reduce(Reg[Int])(tmp_1 by 16){ i =>
-            val block = SRAM[Int](16)
-            val block_len = min(tmp_1 - i, 16.to[Index])
-            block load y_0(i::i+block_len)
+          val tmp_7 = reduceTree(Seq[Index](tmp_1))(min)
+          val tmp_6 = Reduce(Reg[Int])(tmp_7 by 16){ i =>
+            val block_len = min(tmp_7 - i, 16.to[Index])
+            val tmp_8 = SRAM[Int](16)
+            Parallel {
+              tmp_8 load y_0(i::i+block_len)
+            }  // Parallel
             Reduce(Reg[Int])(block_len by 1){ ii =>
               val i2_0 = (i + ii).to[Long]
-              val e2_0 = block(ii)
-
+              val e2_0 = tmp_8(ii)
               val b2_0 = 0.to[Int]
-              val tmp_5 = e1_0 * e2_0
-              val tmp_6 = b2_0 + tmp_5
-
-              tmp_6
+              val tmp_9 = e1_0 * e2_0
+              val tmp_10 = b2_0 + tmp_9
+              tmp_10
             } { _+_ }  // Reduce
           } { _+_ } + b1_0  // Reduce
-
-          tmp_4
+          tmp_6
         } { _+_ }  // Reduce
       } { _+_ } + tmp_2  // Reduce
       out := tmp_3
@@ -53,9 +55,9 @@ object MergerNestedFor extends SpatialApp {
 
   @virtualize
   def main() {
-    val Nx = 160
+    val Nx = 101
     val x = Array.tabulate(Nx){ i => i % 97 }
-    val Ny = 320
+    val Ny = 331
     val y = Array.tabulate(Ny){ i => i % 111 }
 
     val result = spatialProg(x, y)
