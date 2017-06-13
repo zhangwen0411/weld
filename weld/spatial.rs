@@ -453,7 +453,7 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
             // builder
             let builder_sym = gen_expr(builder, glob_ctx, local_ctx)?;
             let builder_kind = match builder.ty {
-                Type::Builder(ref kind) => kind,
+                Type::Builder(ref kind, _) => kind,
                 _ => weld_err!("Builder is not a builder: {}", print_expr(builder))?,
             };
 
@@ -510,7 +510,7 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
         }
 
         ExprKind::NewBuilder(ref builder_expr) => {
-            if let Type::Builder(ref kind) = expr.ty {
+            if let Type::Builder(ref kind, _) = expr.ty {
                 use ast::BuilderKind::*;
                 match *kind {
                     Merger(ref elem_ty, _) => gen_new_merger(elem_ty, glob_ctx, None),
@@ -534,7 +534,7 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
             let builder_sym = gen_expr(builder, glob_ctx, local_ctx)?;
             let value_res = gen_expr(value, glob_ctx, local_ctx)?;
 
-            if let Type::Builder(ref kind) = builder.ty {
+            if let Type::Builder(ref kind, _) = builder.ty {
                 use ast::BuilderKind::*;
                 match *kind {
                     Merger(_, binop) => {
@@ -607,7 +607,7 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
         }
 
         ExprKind::Res { ref builder } => {
-            if let Type::Builder(ref kind) = builder.ty {
+            if let Type::Builder(ref kind, _) = builder.ty {
                 let builder_sym = gen_expr(builder, glob_ctx, local_ctx)?;
                 use ast::BuilderKind::*;
                 match *kind {
@@ -1111,10 +1111,11 @@ fn is_spatial_mutable(ty: &Type) -> bool {
     use ast::Type::*;
     match *ty {
         Scalar(_) => false,
-        Builder(ref kind) => {
+        Builder(ref kind, _) => {
             use ast::BuilderKind::*;
             match *kind {
                 Appender(_) | DictMerger(_, _, _) | VecMerger(_, _) => true,
+                GroupMerger(_, _) => true, // FIXME(zhangwen): what's a GroupMerger?
                 Merger(_, _) => false,
             }
         }
@@ -1240,7 +1241,7 @@ fn _compute_appender_usage(expr: &TypedExpr, aliases: &mut HashSet<Symbol>)
 
             // FIXME(zhangwen): but the retrieved field might be the appender.
             if let Type::Struct(ref types) = struct_expr.ty {
-                if let Type::Builder(BuilderKind::Appender(_)) = types[index as usize] {
+                if let Type::Builder(BuilderKind::Appender(_), _) = types[index as usize] {
                     // The appender might be returned, but for now we can't know for sure...
                     (AppenderUsage::Unsupported, false)
                 } else {
