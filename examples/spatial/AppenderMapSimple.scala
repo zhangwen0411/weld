@@ -15,18 +15,22 @@ object AppenderMapSimple extends SpatialApp {
     val tmp_1 = DRAM[Int](tmp_0)
     Accel {
       Pipe(tmp_0 by 16) { i =>
-        val sram_data = SRAM[Int](16)
         val tmp_2 = SRAM[Int](16)
         val block_size = min(tmp_0 - i, 16.to[Index])
-        sram_data load x_0(i::i+block_size)
+        val tmp_4 = SRAM[Int](16)
+        Parallel {
+          tmp_4 load x_0(i::i+block_size)
+        }  // Parallel
+
         Pipe(block_size by 1) { tmp_3 =>
           val i_0 = (i + tmp_3).to[Long]
-          val x_1 = sram_data(tmp_3)
+          val x_1 = tmp_4(tmp_3)
+
 
           Sequential {
-            val tmp_4 = 2.to[Int]
-            val tmp_5 = x_1 * tmp_4
-            tmp_2(tmp_3) = tmp_5
+            val tmp_5 = 2.to[Int]
+            val tmp_6 = x_1 * tmp_5
+            tmp_2(tmp_3) = tmp_6
 
           }
         }
@@ -39,7 +43,7 @@ object AppenderMapSimple extends SpatialApp {
 
   @virtualize
   def main() {
-    val N = 32*32
+    val N = 2017
     val a = Array.tabulate(N){ i => (i % 97) }
     val (resultArr, resultLen) = unpack(spatialProg(a))
 

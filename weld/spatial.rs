@@ -61,9 +61,16 @@ impl GlobalCtx {
     }
 
     /// Creates a vector (DRAM) with the same element type, length, and length bound as an
-    /// existing vector.  Panics if existing vector doesn't exist.  Returns length symbol.
-    pub fn duplicate_vec(&mut self, old_vec: &Symbol, new_vec: &Symbol) -> Symbol {
-        let vec_info = self.vectors.get(old_vec).unwrap().clone();
+    /// existing vector.  Elem type is also the same unless specified.  Panics if existing vector
+    /// doesn't exist.  Returns length symbol.
+    pub fn duplicate_vec(&mut self, old_vec: &Symbol, new_vec: &Symbol,
+                         o_elem_ty: Option<Type>) -> Symbol {
+        let mut vec_info = self.vectors.get(old_vec).unwrap().clone();
+        if let Some(elem_ty) = o_elem_ty {
+            vec_info.elem_ty = elem_ty;
+        }
+        let vec_info = vec_info;
+
         let len_sym = vec_info.len.clone();
         let elem_ty_scala = gen_scalar_type(&vec_info.elem_ty, format!("Boo")).unwrap();
         self.extra_host_init.add(format!("val {} = DRAM[{}]({})",
@@ -74,19 +81,20 @@ impl GlobalCtx {
 
     /// Same as `duplicate_vec`, except that the new vector has its own length variable,
     /// initialized to zero.  Returns length Symbol.
-    pub fn duplicate_vec_empty(&mut self, old_vec: &Symbol, new_vec: &Symbol) -> Symbol {
+    pub fn duplicate_vec_empty(&mut self, old_vec: &Symbol, new_vec: &Symbol, elem_ty: Type)
+                               -> Symbol {
+        let elem_ty_scala = gen_scalar_type(&elem_ty, format!("Boo")).unwrap();
+
         let new_len_sym = self.add_variable();
         let new_vec_info = {
             let old_vec_info = self.vectors.get(old_vec).unwrap();
             VectorInfo {
                 len: new_len_sym.clone(), len_bound: old_vec_info.len_bound.clone(),
-                elem_ty: old_vec_info.elem_ty.clone(),
+                elem_ty: elem_ty,
             }
         };
         self.extra_accel_init.add(
             format!("val {} = Reg[Index](0.to[Index])", gen_sym(&new_len_sym)));
-
-        let elem_ty_scala = gen_scalar_type(&new_vec_info.elem_ty, format!("Boo")).unwrap();
         self.extra_host_init.add(format!("val {} = DRAM[{}]({})",
               gen_sym(&new_vec), elem_ty_scala, gen_sym(&new_vec_info.len_bound)));
         self.vectors.insert(new_vec.clone(), new_vec_info);
@@ -437,23 +445,11 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                         gen_merger_loop(&data_syms, elem_ty, body, &builder_sym, binop,
                                         b_sym, i_sym, e_sym, glob_ctx, local_ctx),
 
-                    VecMerger(ref elem_ty, binop) => {
-                        if data_syms.len() > 1 {
-                            weld_err!("Not yet supported (zip): {}", print_expr(&expr))
-                        } else {
-                            let data_res = &data_syms[0];
-                            let data_ty = &glob_ctx.get_vec_info(&data_res).elem_ty;
-                            gen_vecmerger_loop(&data_res, &data_ty, elem_ty, body, &builder_sym,
-                                               binop, b_sym, i_sym, e_sym, glob_ctx, local_ctx)
-                        }
-                    }
+                    VecMerger(ref elem_ty, binop) =>
+                        gen_vecmerger_loop(&data_syms, elem_ty, body, &builder_sym,
+                                           binop, b_sym, i_sym, e_sym, glob_ctx, local_ctx),
 
                     Appender(ref elem_ty) => {
-                        if data_syms.len() > 1 {
-                            weld_err!("Not yet supported (zip): {}", print_expr(&expr))?;
-                        }
-                        let data_res = &data_syms[0];
-
                         // Prohibit the appender from being used again.
                         let old_state = local_ctx.appenders.insert(builder_sym.clone(),
                                                                    AppenderState::Dead).unwrap();
@@ -470,10 +466,10 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
 
                         use self::AppenderUsage::*;
                         match usage {
-                            Once => gen_map_loop(&data_res, elem_ty, body, &builder_sym,
+                            Once => gen_map_loop(&data_syms, elem_ty, body, &builder_sym,
                                                  b_sym, i_sym, e_sym, glob_ctx, local_ctx),
                             AtMostOnce =>
-                                gen_filter_loop(&data_res, elem_ty, body, &builder_sym,
+                                gen_filter_loop(&data_syms, elem_ty, body, &builder_sym,
                                                 b_sym, i_sym, e_sym, glob_ctx, local_ctx),
                             Unused | Unsupported =>
                                 weld_err!("Unsupported appender usage {:?}: {}",
@@ -628,31 +624,83 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
     }
 }
 
-fn gen_vecmerger_loop(data_sym: &Symbol, data_ty: &Type, dst_ty: &Type, body: &TypedExpr,
+/// For each array: declares a SRAM and loads block (start::start+extent) into the block.
+/// Each SRAM can hold blk elements. Returns the SRAM symbols corresponding to the array symbols.
+fn gen_load_arr_blocks(data_syms: &Vec<Symbol>, blk: usize, start: &str, extent: &str,
+                       glob_ctx: &mut GlobalCtx) -> WeldResult<Vec<Symbol>> {
+    let block_syms = glob_ctx.add_variables(data_syms.len());
+    // Declare the local SRAMs.
+    for (data_sym, block_sym) in data_syms.iter().zip(block_syms.iter()) {
+        let data_ty = &glob_ctx.get_vec_info(&data_sym).elem_ty;
+        let data_ty_scala = gen_scalar_type(data_ty, format!(
+                "Not supported vector elem type: {}", print_type(data_ty)))?;
+        add_code!(glob_ctx, "val {} = SRAM[{}]({})", gen_sym(&block_sym), data_ty_scala, blk);
+    }
+    // Load into them.
+    add_code!(glob_ctx, "Parallel {{");
+    for (data_sym, block_sym) in data_syms.iter().zip(block_syms.iter()) {
+        add_code!(glob_ctx, "{block} load {arr}({start}::{start}+{extent})",
+                  block=gen_sym(&block_sym), arr=gen_sym(&data_sym), start=start, extent=extent);
+    }
+    add_code!(glob_ctx, "}}  // Parallel");
+
+    Ok(block_syms)
+}
+
+/// Declares the `e` parameter for loop body.
+fn gen_loop_e(e_sym: &Symbol, block_syms: &Vec<Symbol>, loop_var: &str, glob_ctx: &mut GlobalCtx,
+              local_ctx: &mut LocalCtx) {
+    assert!(!block_syms.is_empty());
+    if block_syms.len() == 1 { // `e` is just an element.
+        add_code!(glob_ctx, "val {} = {}({})", gen_sym(&e_sym), gen_sym(&block_syms[0]), loop_var);
+    } else { // `e` is a struct of elements.
+        let component_syms = glob_ctx.add_variables(block_syms.len());
+        for (block_sym, component_sym) in block_syms.iter().zip(component_syms.iter()) {
+            add_code!(glob_ctx, "val {} = {}({})", gen_sym(&component_sym), gen_sym(&block_sym),
+                      loop_var);
+        }
+        local_ctx.structs.insert(e_sym.clone(), component_syms);
+    }
+}
+
+fn gen_vecmerger_loop(data_syms: &Vec<Symbol>, dst_ty: &Type, body: &TypedExpr,
                       dst_sym: &Symbol, binop: BinOpKind,
                       b_sym: &Symbol, i_sym: &Symbol, e_sym: &Symbol,
                       glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx) -> WeldResult<Symbol> {
-    const BLK_SIZE_DST: i32 = 16; // TODO(zhangwen): tunable parameter.
-    const BLK_SIZE_SRC: i32 = 32; // TODO(zhangwen): tunable parameter.
+    assert!(!data_syms.is_empty());
+
+    const BLK_SIZE_DST: usize = 16; // TODO(zhangwen): tunable parameter.
+    const BLK_SIZE_SRC: usize = 32; // TODO(zhangwen): tunable parameter.
     const PAR: i32 = 4;
     let dst_veclen_sym = &glob_ctx.get_vec_info(&dst_sym).len;
 
     // Merge into blocks of vecmerger, one by one.
     let dst_ty_scala = gen_scalar_type(dst_ty, format!(
             "Not supported vecmerger elem type: {}", print_type(dst_ty)))?;
-    let data_ty_scala = gen_scalar_type(data_ty, format!(
-            "Not supported data vec elem type: {}", print_type(data_ty)))?;
     let dst_sram_sym = glob_ctx.add_variable();
     let range_start_sym = glob_ctx.add_variable();
     let dst_block_size_sym = glob_ctx.add_variable();
-    let data_len_sym = &glob_ctx.get_vec_info(&data_sym).len;
+    let data_len_sym = &glob_ctx.get_vec_info(&data_syms[0]).len;
     let local_dst_sram_sym = glob_ctx.add_variable();
+
+    // Generate code to load blocks of data into SRAMs.
+    glob_ctx.enter_builder_scope();
+    let block_syms = gen_load_arr_blocks(data_syms, BLK_SIZE_SRC, "base", "data_block_size",
+                                         glob_ctx)?;
+    let load_arrs_code = glob_ctx.exit_builder_scope();
 
     // Generate body code.
     let mut sub_local_ctx = local_ctx.clone();
+
+    // Initialize `e`.
+    glob_ctx.enter_builder_scope();
+    gen_loop_e(e_sym, &block_syms, "ii", glob_ctx, &mut sub_local_ctx);
+    let init_e_code = glob_ctx.exit_builder_scope();
+
     sub_local_ctx.vecmergers.insert(b_sym.clone(),
         VecMergerState { sram_sym: &local_dst_sram_sym, range_start_sym: &range_start_sym,
                          range_size_sym: &dst_block_size_sym });
+
     glob_ctx.enter_builder_scope();
     let body_res = gen_expr(body, glob_ctx, &mut sub_local_ctx)?;
     assert_eq!(body_res, *b_sym); // Body should return builder derived from `b`.
@@ -687,15 +735,14 @@ fn gen_vecmerger_loop(data_sym: &Symbol, data_ty: &Type, dst_ty: &Type, body: &T
 
                 Pipe({data_len} by round_blk) {{ i =>
                     val base = par_offset + i
-                    val data_sram = SRAM[{data_ty}]({data_blk})
                     val data_block_size =
                         min(max({data_len} - base, 0.to[Index]), {data_blk}.to[Index])
-                    data_sram load {data_dram}(base::base+data_block_size)
+                    {load_arrs_code}
 
                     Pipe(data_block_size by 1) {{ ii =>
                         // TODO(zhangwen): Spatial indices are 32-bit.
                         val {i_sym} = (base + ii).to[Long]
-                        val {e_sym} = data_sram(ii)
+                        {init_e_code}
 
                         Sequential {{
                             {body_code}
@@ -717,13 +764,12 @@ fn gen_vecmerger_loop(data_sym: &Symbol, data_ty: &Type, dst_ty: &Type, body: &T
         dst_sram = gen_sym(&dst_sram_sym),
         dst_dram = gen_sym(&dst_sym),
         ty = dst_ty_scala,
-        data_ty = data_ty_scala,
+        load_arrs_code = load_arrs_code,
         data_len = gen_sym(&data_len_sym),
         data_blk = BLK_SIZE_SRC,
-        data_dram = gen_sym(&data_sym),
         local_dst_sram = gen_sym(&local_dst_sram_sym),
         i_sym = gen_sym(i_sym),
-        e_sym = gen_sym(e_sym),
+        init_e_code = init_e_code,
         body_code = body_code,
         binop = binop);
 
@@ -734,18 +780,15 @@ fn gen_merger_loop(data_syms: &Vec<Symbol>, merger_elem_ty: &Type, body: &TypedE
                    merger_sym: &Symbol, binop: BinOpKind,
                    b_sym: &Symbol, i_sym: &Symbol, e_sym: &Symbol,
                    glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx) -> WeldResult<Symbol> {
-    const BLK_SIZE: i32 = 16; // TODO(zhangwen): tunable parameter.
+    assert!(!data_syms.is_empty());
+
+    const BLK_SIZE: usize = 16; // TODO(zhangwen): tunable parameter.
     let reduce_res = glob_ctx.add_variable();
     let merger_type_scala = gen_scalar_type(merger_elem_ty, format!(
             "Not supported merger elem type: {}", print_type(merger_elem_ty)))?;
 
-    // TODO(zhangwen): I assume length of zip is the same as the shortest vector.
-    let len_sym = glob_ctx.add_variable();
-    let veclens_concat = data_syms.iter().map(|sym| {
-        gen_sym(&glob_ctx.get_vec_info(&sym).len)
-    }).collect::<Vec<_>>().join(", ");
-    add_code!(glob_ctx, "val {} = reduceTree(Seq[Index]({}))(min)",
-              gen_sym(&len_sym), veclens_concat);
+    // Assuming that the vectors to iterate over have the same length.
+    let len_sym = glob_ctx.get_vec_info(&data_syms[0]).len;
 
     // TODO(zhangwen): Spatial indices are 32-bit.
     // FIXME(zhangwen): do I need Sequential around body_code?
@@ -755,20 +798,7 @@ fn gen_merger_loop(data_syms: &Vec<Symbol>, merger_elem_ty: &Type, body: &TypedE
         reduce_res = gen_sym(&reduce_res), ty = merger_type_scala,
         veclen = gen_sym(&len_sym), blk = BLK_SIZE);
 
-    let block_syms = glob_ctx.add_variables(data_syms.len());
-    // Declare the local SRAMs.
-    for (data_sym, block_sym) in data_syms.iter().zip(block_syms.iter()) {
-        let data_ty = &glob_ctx.get_vec_info(&data_sym).elem_ty;
-        let data_ty_scala = gen_scalar_type(data_ty, format!(
-                "Not supported vector elem type: {}", print_type(data_ty)))?;
-        add_code!(glob_ctx, "val {} = SRAM[{}]({})", gen_sym(&block_sym), data_ty_scala, BLK_SIZE);
-    }
-    // Load into them.
-    add_code!(glob_ctx, "Parallel {{");
-    for (data_sym, block_sym) in data_syms.iter().zip(block_syms.iter()) {
-        add_code!(glob_ctx, "{} load {}(i::i+block_len)", gen_sym(&block_sym), gen_sym(&data_sym));
-    }
-    add_code!(glob_ctx, "}}  // Parallel");
+    let block_syms = gen_load_arr_blocks(data_syms, BLK_SIZE, "i", "block_len", glob_ctx)?;
 
     // Go through each element in the block(s).
     add_code!(glob_ctx, "\
@@ -778,16 +808,7 @@ fn gen_merger_loop(data_syms: &Vec<Symbol>, merger_elem_ty: &Type, body: &TypedE
 
     // Prepare to generate code for body.
     let mut sub_local_ctx = local_ctx.clone();
-    if data_syms.len() == 1 { // `e` is just an element.
-        add_code!(glob_ctx, "val {} = {}(ii)", gen_sym(&e_sym), gen_sym(&block_syms[0]));
-    } else { // `e` is a struct of elements.
-        let component_syms = glob_ctx.add_variables(data_syms.len());
-        for (block_sym, component_sym) in block_syms.iter().zip(component_syms.iter()) {
-            add_code!(glob_ctx, "val {} = {}(ii)", gen_sym(&component_sym), gen_sym(&block_sym));
-        }
-        sub_local_ctx.structs.insert(e_sym.clone(), component_syms);
-    }
-
+    gen_loop_e(&e_sym, &block_syms, "ii", glob_ctx, &mut sub_local_ctx);
     // Create new merger for `b`; all local merges are gathered into it.
     gen_new_merger(merger_elem_ty, glob_ctx, Some(b_sym))?;
     let body_res = gen_expr(body, glob_ctx, &mut sub_local_ctx)?;
@@ -804,36 +825,47 @@ fn gen_merger_loop(data_syms: &Vec<Symbol>, merger_elem_ty: &Type, body: &TypedE
     Ok(reduce_res)
 }
 
-fn gen_map_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
+fn gen_map_loop(data_syms: &Vec<Symbol>, elem_ty: &Type, body: &TypedExpr,
                 appender_sym: &Symbol, b_sym: &Symbol, i_sym: &Symbol, e_sym: &Symbol,
                 glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx) -> WeldResult<Symbol> {
     let elem_type_scala = gen_scalar_type(elem_ty, format!("Not supported appender type: {}",
                                                            print_type(elem_ty)))?;
     // The result of a map operation has the same length as the data.
-    let veclen_sym = glob_ctx.duplicate_vec(&data_sym, &appender_sym);
+    let veclen_sym = glob_ctx.duplicate_vec(&data_syms[0], &appender_sym, Some(elem_ty.clone()));
 
     let sram_dst_sym = glob_ctx.add_variable();
     let ii_sym = glob_ctx.add_variable();
 
+    // Generate code to load blocks of data into SRAMs.
+    glob_ctx.enter_builder_scope();
+    let block_syms = gen_load_arr_blocks(data_syms, BLK_SIZE, "i", "block_size", glob_ctx)?;
+    let load_arrs_code = glob_ctx.exit_builder_scope();
+
     // Generate body code.
     let mut sub_local_ctx = local_ctx.clone();
+
+    // Initialize `e`.
+    glob_ctx.enter_builder_scope();
+    gen_loop_e(e_sym, &block_syms, gen_sym(&ii_sym).as_str(), glob_ctx, &mut sub_local_ctx);
+    let init_e_code = glob_ctx.exit_builder_scope();
+
     sub_local_ctx.appenders.insert(
         b_sym.clone(), AppenderState::Map { sram_sym: &sram_dst_sym, ii_sym: &ii_sym });
+
     glob_ctx.enter_builder_scope();
     let body_res = gen_expr(body, glob_ctx, &mut sub_local_ctx)?;
     assert_eq!(body_res, *b_sym); // Body should return builder derived from `b`.
     let body_code = glob_ctx.exit_builder_scope();
 
-    const BLK_SIZE: i32 = 16;
+    const BLK_SIZE: usize = 16;
     add_code!(glob_ctx, "\
         Pipe({veclen} by {blk}) {{ i =>
-            val sram_data = SRAM[{ty}]({blk})
             val {sram_dst} = SRAM[{ty}]({blk})
             val block_size = min({veclen} - i, {blk}.to[Index])
-            sram_data load {data}(i::i+block_size)
+            {load_arrs_code}
             Pipe(block_size by 1) {{ {ii} =>
                 val {i_sym} = (i + {ii}).to[Long]
-                val {e_sym} = sram_data({ii})
+                {init_e_code}
 
                 Sequential {{
                     {body_code}
@@ -846,19 +878,21 @@ fn gen_map_loop(data_sym: &Symbol, elem_ty: &Type, body: &TypedExpr,
         blk = BLK_SIZE,
         ty = elem_type_scala,
         sram_dst = gen_sym(&sram_dst_sym),
-        data = gen_sym(&data_sym),
+        load_arrs_code = load_arrs_code,
         ii = gen_sym(&ii_sym),
         i_sym = gen_sym(&i_sym),
-        e_sym = gen_sym(&e_sym),
+        init_e_code = init_e_code,
         body_code = body_code,
         dst = gen_sym(&appender_sym));
 
     Ok(appender_sym.clone())
 }
 
-fn gen_filter_loop(data_sym: &Symbol, appender_elem_ty: &Type, body: &TypedExpr,
+fn gen_filter_loop(data_syms: &Vec<Symbol>, appender_elem_ty: &Type, body: &TypedExpr,
                    appender_sym: &Symbol, b_sym: &Symbol, i_sym: &Symbol, e_sym: &Symbol,
                    glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx) -> WeldResult<Symbol> {
+    assert!(!data_syms.is_empty());
+
     let elem_type_scala = {
         let err_msg = format!("Not supported appender type: {}", print_type(appender_elem_ty));
         gen_scalar_type(appender_elem_ty, err_msg)?
@@ -868,8 +902,9 @@ fn gen_filter_loop(data_sym: &Symbol, appender_elem_ty: &Type, body: &TypedExpr,
     const PAR: usize = 4;
 
     // Make new vector.
-    let data_len_sym = glob_ctx.get_vec_info(&data_sym).len;
-    let result_veclen_sym = glob_ctx.duplicate_vec_empty(&data_sym, &appender_sym);
+    let data_len_sym = glob_ctx.get_vec_info(&data_syms[0]).len;
+    let result_veclen_sym = glob_ctx.duplicate_vec_empty(&data_syms[0], &appender_sym,
+                                                         appender_elem_ty.clone());
 
     // Manually unroll for parallelism...
     // FIXME(zhangwen): can't use design space exploration on PAR this way...
@@ -888,9 +923,20 @@ fn gen_filter_loop(data_sym: &Symbol, appender_elem_ty: &Type, body: &TypedExpr,
     // Evaluate condition on blocks in parallel.
     add_code!(glob_ctx, "Parallel {{");
     for (par_id, fifo_sym) in fifo_syms.iter().enumerate() {
+        // Generate code to load blocks of data into SRAMs.
+        glob_ctx.enter_builder_scope();
+        let block_syms = gen_load_arr_blocks(data_syms, BLK_SIZE, "base", "block_size", glob_ctx)?;
+        let load_arrs_code = glob_ctx.exit_builder_scope();
+
         // Generate body code.
         // FIXME(zhangwen): shouldn't need to generate body code `PAR` times...
         let mut sub_local_ctx = local_ctx.clone();
+
+        // Initialize `e`.
+        glob_ctx.enter_builder_scope();
+        gen_loop_e(e_sym, &block_syms, "ii", glob_ctx, &mut sub_local_ctx);
+        let init_e_code = glob_ctx.exit_builder_scope();
+
         sub_local_ctx.appenders.insert(
             b_sym.clone(), AppenderState::Filter { fifo_sym: &fifo_sym });
         glob_ctx.enter_builder_scope();
@@ -901,13 +947,12 @@ fn gen_filter_loop(data_sym: &Symbol, appender_elem_ty: &Type, body: &TypedExpr,
         add_code!(glob_ctx, "\
         {{  // #{par_id}
             val base = (i + {par_id}*{blk}).to[Index]
-            val block_len = min(max({data_len} - base, 0.to[Index]), {blk}.to[Index])
-            val sram_data = SRAM[{ty}]({blk})
-            sram_data load {data}(base::base+block_len)
+            val block_size = min(max({data_len} - base, 0.to[Index]), {blk}.to[Index])
+            {load_arrs_code}
 
-            Pipe(block_len by 1) {{ ii =>
+            Pipe(block_size by 1) {{ ii =>
                 val {i_sym} = (base + ii).to[Long]
-                val {e_sym} = sram_data(ii)
+                {init_e_code}
 
                 Sequential {{
                     {body_code}
@@ -919,10 +964,9 @@ fn gen_filter_loop(data_sym: &Symbol, appender_elem_ty: &Type, body: &TypedExpr,
         par_id = par_id,
         blk = BLK_SIZE,
         data_len = gen_sym(&data_len_sym),
-        ty = elem_type_scala,
-        data = gen_sym(&data_sym),
+        load_arrs_code = load_arrs_code,
         i_sym = gen_sym(&i_sym),
-        e_sym = gen_sym(&e_sym),
+        init_e_code = init_e_code,
         body_code = body_code);
     }
     add_code!(glob_ctx, "}}  // Parallel");
@@ -967,10 +1011,10 @@ fn gen_new_vecmerger(vec_sym: &Symbol, elem_ty: &Type, glob_ctx: &mut GlobalCtx)
     let elem_type_scala = gen_scalar_type(elem_ty, format!("Not supported vecmerger type: {}",
                                                            print_type(elem_ty)))?;
     let vecmerger_sym = glob_ctx.add_variable();
-    let veclen_sym = glob_ctx.duplicate_vec(&vec_sym, &vecmerger_sym);
+    let veclen_sym = glob_ctx.duplicate_vec(&vec_sym, &vecmerger_sym, None);
 
     // Copy from `vec_sym` to `vecmerger_sym`. Could do this lazily, but probably not worth it.
-    const BLK_SIZE: i32 = 16; // TODO(zhangwen): tunable parameter.
+    const BLK_SIZE: usize = 16; // TODO(zhangwen): tunable parameter.
     add_code!(glob_ctx, "\
         Pipe({veclen} by {blk}) {{ i =>
             val ss = SRAM[{ty}]({blk})

@@ -14,22 +14,21 @@ object MergerNestedMerge extends SpatialApp {
     val out = ArgOut[Long]
     Accel {
       val tmp_1 = 0.to[Long]
-      val tmp_3 = reduceTree(Seq[Index](tmp_0))(min)
-      val tmp_2 = Reduce(Reg[Long])(tmp_3 by 16){ i =>
-        val block_len = min(tmp_3 - i, 16.to[Index])
-        val tmp_4 = SRAM[Long](16)
+      val tmp_2 = Reduce(Reg[Long])(tmp_0 by 16){ i =>
+        val block_len = min(tmp_0 - i, 16.to[Index])
+        val tmp_3 = SRAM[Long](16)
         Parallel {
-          tmp_4 load v_0(i::i+block_len)
+          tmp_3 load v_0(i::i+block_len)
         }  // Parallel
         Reduce(Reg[Long])(block_len by 1){ ii =>
           val i_0 = (i + ii).to[Long]
-          val e_0 = tmp_4(ii)
+          val e_0 = tmp_3(ii)
           val b_0 = 0.to[Long]
-          val tmp_5 = b_0 + i_0
-          val tmp_6 = 5.to[Long]
-          val tmp_7 = tmp_6 * e_0
-          val tmp_8 = tmp_5 + tmp_7
-          tmp_8
+          val tmp_4 = b_0 + i_0
+          val tmp_5 = 5.to[Long]
+          val tmp_6 = tmp_5 * e_0
+          val tmp_7 = tmp_4 + tmp_6
+          tmp_7
         } { _+_ }  // Reduce
       } { _+_ } + tmp_1  // Reduce
       out := tmp_2

@@ -15,19 +15,22 @@ object AppenderMapSimple2 extends SpatialApp {
     val tmp_1 = DRAM[Int](tmp_0)
     Accel {
       Pipe(tmp_0 by 16) { i =>
-        val sram_data = SRAM[Int](16)
         val tmp_2 = SRAM[Int](16)
         val block_size = min(tmp_0 - i, 16.to[Index])
-        sram_data load x_0(i::i+block_size)
+        val tmp_4 = SRAM[Int](16)
+        Parallel {
+          tmp_4 load x_0(i::i+block_size)
+        }  // Parallel
+
         Pipe(block_size by 1) { tmp_3 =>
           val i_0 = (i + tmp_3).to[Long]
-          val x_1 = sram_data(tmp_3)
+          val x_1 = tmp_4(tmp_3)
+
 
           Sequential {
-            val tmp_4 = 0.to[Int]
-            val tmp_6 = reduceTree(Seq[Index](tmp_0))(min)
-            val tmp_5 = Reduce(Reg[Int])(tmp_6 by 16){ i =>
-              val block_len = min(tmp_6 - i, 16.to[Index])
+            val tmp_5 = 0.to[Int]
+            val tmp_6 = Reduce(Reg[Int])(tmp_0 by 16){ i =>
+              val block_len = min(tmp_0 - i, 16.to[Index])
               val tmp_7 = SRAM[Int](16)
               Parallel {
                 tmp_7 load x_0(i::i+block_len)
@@ -41,8 +44,8 @@ object AppenderMapSimple2 extends SpatialApp {
                 val tmp_10 = b_1 + tmp_9
                 tmp_10
               } { _+_ }  // Reduce
-            } { _+_ } + tmp_4  // Reduce
-            val tmp_11 = x_1 * tmp_5
+            } { _+_ } + tmp_5  // Reduce
+            val tmp_11 = x_1 * tmp_6
             tmp_2(tmp_3) = tmp_11
 
           }
@@ -56,7 +59,7 @@ object AppenderMapSimple2 extends SpatialApp {
 
   @virtualize
   def main() {
-    val N = 32*32
+    val N = 1011
     val a = Array.tabulate(N){ i => (i % 97) }
     val (resultArr, resultLen) = unpack(spatialProg(a))
 

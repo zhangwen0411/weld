@@ -14,24 +14,23 @@ object MergerConditional extends SpatialApp {
     val out = ArgOut[Int]
     Accel {
       val tmp_1 = 0.to[Int]
-      val tmp_3 = reduceTree(Seq[Index](tmp_0))(min)
-      val tmp_2 = Reduce(Reg[Int])(tmp_3 by 16){ i =>
-        val block_len = min(tmp_3 - i, 16.to[Index])
-        val tmp_4 = SRAM[Int](16)
+      val tmp_2 = Reduce(Reg[Int])(tmp_0 by 16){ i =>
+        val block_len = min(tmp_0 - i, 16.to[Index])
+        val tmp_3 = SRAM[Int](16)
         Parallel {
-          tmp_4 load v_0(i::i+block_len)
+          tmp_3 load v_0(i::i+block_len)
         }  // Parallel
         Reduce(Reg[Int])(block_len by 1){ ii =>
           val i_0 = (i + ii).to[Long]
-          val e_0 = tmp_4(ii)
+          val e_0 = tmp_3(ii)
           val b_0 = 0.to[Int]
-          val tmp_5 = 0.to[Int]
-          val tmp_6 = e_0 > tmp_5
-          val tmp_7 = b_0 + e_0
-          val tmp_8 = -e_0
-          val tmp_9 = b_0 + tmp_8
-          val tmp_10 = mux(tmp_6, tmp_7, tmp_9)
-          tmp_10
+          val tmp_4 = 0.to[Int]
+          val tmp_5 = e_0 > tmp_4
+          val tmp_6 = b_0 + e_0
+          val tmp_7 = -e_0
+          val tmp_8 = b_0 + tmp_7
+          val tmp_9 = mux(tmp_5, tmp_6, tmp_8)
+          tmp_9
         } { _+_ }  // Reduce
       } { _+_ } + tmp_1  // Reduce
       out := tmp_2

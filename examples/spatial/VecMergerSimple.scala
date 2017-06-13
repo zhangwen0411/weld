@@ -32,22 +32,26 @@ object VecMergerSimple extends SpatialApp {
 
           Pipe(tmp_0 by round_blk) { i =>
             val base = par_offset + i
-            val data_sram = SRAM[Int](32)
             val data_block_size =
             min(max(tmp_0 - base, 0.to[Index]), 32.to[Index])
-            data_sram load x_0(base::base+data_block_size)
+            val tmp_6 = SRAM[Int](32)
+            Parallel {
+              tmp_6 load x_0(base::base+data_block_size)
+            }  // Parallel
+
 
             Pipe(data_block_size by 1) { ii =>
               // TODO(zhangwen): Spatial indices are 32-bit.
               val i_0 = (base + ii).to[Long]
-              val e_0 = data_sram(ii)
+              val e_0 = tmp_6(ii)
+
 
               Sequential {
-                val tmp_6 = 7.to[Int]
-                val tmp_7 = e_0 * tmp_6
-                val tmp_9 = i_0.to[Index] - tmp_3
-                if (tmp_9 >= 0 && tmp_9 < tmp_4) {
-                  tmp_5(tmp_9) = tmp_5(tmp_9) + tmp_7
+                val tmp_7 = 7.to[Int]
+                val tmp_8 = e_0 * tmp_7
+                val tmp_10 = i_0.to[Index] - tmp_3
+                if (tmp_10 >= 0 && tmp_10 < tmp_4) {
+                  tmp_5(tmp_10) = tmp_5(tmp_10) + tmp_8
                 }
 
               }  // Sequential

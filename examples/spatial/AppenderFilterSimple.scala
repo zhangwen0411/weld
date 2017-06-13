@@ -24,20 +24,24 @@ object AppenderFilterSimple extends SpatialApp {
         Parallel {
           {  // #0
             val base = (i + 0*16).to[Index]
-            val block_len = min(max(tmp_0 - base, 0.to[Index]), 16.to[Index])
-            val sram_data = SRAM[Int](16)
-            sram_data load v_0(base::base+block_len)
+            val block_size = min(max(tmp_0 - base, 0.to[Index]), 16.to[Index])
+            val tmp_7 = SRAM[Int](16)
+            Parallel {
+              tmp_7 load v_0(base::base+block_size)
+            }  // Parallel
 
-            Pipe(block_len by 1) { ii =>
+
+            Pipe(block_size by 1) { ii =>
               val i_0 = (base + ii).to[Long]
-              val e_0 = sram_data(ii)
+              val e_0 = tmp_7(ii)
+
 
               Sequential {
-                val tmp_7 = 42.to[Int]
-                val tmp_8 = e_0 > tmp_7
-                if (tmp_8) {
-                  val tmp_9 = e_0 * e_0
-                  tmp_3.enq(tmp_9)
+                val tmp_8 = 42.to[Int]
+                val tmp_9 = e_0 > tmp_8
+                if (tmp_9) {
+                  val tmp_10 = e_0 * e_0
+                  tmp_3.enq(tmp_10)
 
                 } else {
 
@@ -49,20 +53,24 @@ object AppenderFilterSimple extends SpatialApp {
 
           {  // #1
             val base = (i + 1*16).to[Index]
-            val block_len = min(max(tmp_0 - base, 0.to[Index]), 16.to[Index])
-            val sram_data = SRAM[Int](16)
-            sram_data load v_0(base::base+block_len)
+            val block_size = min(max(tmp_0 - base, 0.to[Index]), 16.to[Index])
+            val tmp_11 = SRAM[Int](16)
+            Parallel {
+              tmp_11 load v_0(base::base+block_size)
+            }  // Parallel
 
-            Pipe(block_len by 1) { ii =>
+
+            Pipe(block_size by 1) { ii =>
               val i_0 = (base + ii).to[Long]
-              val e_0 = sram_data(ii)
+              val e_0 = tmp_11(ii)
+
 
               Sequential {
-                val tmp_10 = 42.to[Int]
-                val tmp_11 = e_0 > tmp_10
-                if (tmp_11) {
-                  val tmp_12 = e_0 * e_0
-                  tmp_4.enq(tmp_12)
+                val tmp_12 = 42.to[Int]
+                val tmp_13 = e_0 > tmp_12
+                if (tmp_13) {
+                  val tmp_14 = e_0 * e_0
+                  tmp_4.enq(tmp_14)
 
                 } else {
 
@@ -74,20 +82,24 @@ object AppenderFilterSimple extends SpatialApp {
 
           {  // #2
             val base = (i + 2*16).to[Index]
-            val block_len = min(max(tmp_0 - base, 0.to[Index]), 16.to[Index])
-            val sram_data = SRAM[Int](16)
-            sram_data load v_0(base::base+block_len)
+            val block_size = min(max(tmp_0 - base, 0.to[Index]), 16.to[Index])
+            val tmp_15 = SRAM[Int](16)
+            Parallel {
+              tmp_15 load v_0(base::base+block_size)
+            }  // Parallel
 
-            Pipe(block_len by 1) { ii =>
+
+            Pipe(block_size by 1) { ii =>
               val i_0 = (base + ii).to[Long]
-              val e_0 = sram_data(ii)
+              val e_0 = tmp_15(ii)
+
 
               Sequential {
-                val tmp_13 = 42.to[Int]
-                val tmp_14 = e_0 > tmp_13
-                if (tmp_14) {
-                  val tmp_15 = e_0 * e_0
-                  tmp_5.enq(tmp_15)
+                val tmp_16 = 42.to[Int]
+                val tmp_17 = e_0 > tmp_16
+                if (tmp_17) {
+                  val tmp_18 = e_0 * e_0
+                  tmp_5.enq(tmp_18)
 
                 } else {
 
@@ -99,20 +111,24 @@ object AppenderFilterSimple extends SpatialApp {
 
           {  // #3
             val base = (i + 3*16).to[Index]
-            val block_len = min(max(tmp_0 - base, 0.to[Index]), 16.to[Index])
-            val sram_data = SRAM[Int](16)
-            sram_data load v_0(base::base+block_len)
+            val block_size = min(max(tmp_0 - base, 0.to[Index]), 16.to[Index])
+            val tmp_19 = SRAM[Int](16)
+            Parallel {
+              tmp_19 load v_0(base::base+block_size)
+            }  // Parallel
 
-            Pipe(block_len by 1) { ii =>
+
+            Pipe(block_size by 1) { ii =>
               val i_0 = (base + ii).to[Long]
-              val e_0 = sram_data(ii)
+              val e_0 = tmp_19(ii)
+
 
               Sequential {
-                val tmp_16 = 42.to[Int]
-                val tmp_17 = e_0 > tmp_16
-                if (tmp_17) {
-                  val tmp_18 = e_0 * e_0
-                  tmp_6.enq(tmp_18)
+                val tmp_20 = 42.to[Int]
+                val tmp_21 = e_0 > tmp_20
+                if (tmp_21) {
+                  val tmp_22 = e_0 * e_0
+                  tmp_6.enq(tmp_22)
 
                 } else {
 
@@ -123,17 +139,17 @@ object AppenderFilterSimple extends SpatialApp {
           }  // #3
 
         }  // Parallel
-        val tmp_19 = tmp_3.numel
-        val tmp_20 = tmp_3.numel+tmp_4.numel
-        val tmp_21 = tmp_3.numel+tmp_4.numel+tmp_5.numel
-        val tmp_22 = tmp_3.numel+tmp_4.numel+tmp_5.numel+tmp_6.numel
+        val tmp_23 = tmp_3.numel
+        val tmp_24 = tmp_3.numel+tmp_4.numel
+        val tmp_25 = tmp_3.numel+tmp_4.numel+tmp_5.numel
+        val tmp_26 = tmp_3.numel+tmp_4.numel+tmp_5.numel+tmp_6.numel
         Parallel {
-          tmp_1(tmp_2+tmp_19-tmp_3.numel::tmp_2+tmp_19) store tmp_3
-          tmp_1(tmp_2+tmp_20-tmp_4.numel::tmp_2+tmp_20) store tmp_4
-          tmp_1(tmp_2+tmp_21-tmp_5.numel::tmp_2+tmp_21) store tmp_5
-          tmp_1(tmp_2+tmp_22-tmp_6.numel::tmp_2+tmp_22) store tmp_6
+          tmp_1(tmp_2+tmp_23-tmp_3.numel::tmp_2+tmp_23) store tmp_3
+          tmp_1(tmp_2+tmp_24-tmp_4.numel::tmp_2+tmp_24) store tmp_4
+          tmp_1(tmp_2+tmp_25-tmp_5.numel::tmp_2+tmp_25) store tmp_5
+          tmp_1(tmp_2+tmp_26-tmp_6.numel::tmp_2+tmp_26) store tmp_6
         }  // Parallel
-        tmp_2 := tmp_2 + tmp_22
+        tmp_2 := tmp_2 + tmp_26
       }  // Sequential
       len := tmp_2
     }
