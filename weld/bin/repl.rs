@@ -30,8 +30,6 @@ use weld::spatial::ast_to_spatial;
 use weld::util::load_runtime_library;
 use weld::util::MERGER_BC;
 
-use weld::transforms;
-
 enum ReplCommands {
     LoadFile,
 }
