@@ -1,6 +1,6 @@
 //! Emits Spatial code for Weld AST.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::ast::*;
 use super::code_builder::CodeBuilder;
@@ -168,6 +168,7 @@ struct LocalCtx<'a> {
     pub vecmergers: HashMap<Symbol, VecMergerState<'a>>,
     pub appenders: HashMap<Symbol, AppenderState<'a>>,
     pub structs: HashMap<Symbol, Vec<Symbol>>, // symbol for struct value => components
+    aliases: HashMap<Symbol, Symbol>,
 }
 
 impl<'a> LocalCtx<'a> {
@@ -176,7 +177,23 @@ impl<'a> LocalCtx<'a> {
             vecmergers: HashMap::new(),
             appenders: HashMap::new(),
             structs: HashMap::new(),
+            aliases: HashMap::new(),
         }
+    }
+
+    /// Adds `alias` as an alias of `sym`.
+    pub fn add_alias(&mut self, alias: Symbol, sym: &Symbol) {
+        // If `sym` has a "parent", the parent has to be a root.
+        let sym = if let Some(ref parent) = self.aliases.get(sym) { parent } else { sym }.clone();
+        self.aliases.insert(alias, sym);
+    }
+
+    pub fn resolve_alias(&self, alias: &Symbol) -> Symbol {
+        (if let Some(sym) = self.aliases.get(alias) { sym } else { alias }).clone()
+    }
+
+    pub fn are_alias(&self, sym1: &Symbol, sym2: &Symbol) -> bool {
+        self.resolve_alias(sym1) == self.resolve_alias(sym2)
     }
 }
 
@@ -337,7 +354,7 @@ fn gen_scalar_type(ty: &Type, err_msg: String) -> WeldResult<String> {
 fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx)
             -> WeldResult<Symbol> {
     match expr.kind {
-        ExprKind::Ident(ref sym) => Ok(sym.clone()),
+        ExprKind::Ident(ref sym) => Ok(local_ctx.resolve_alias(sym)),
 
         ExprKind::Literal(lit) => {
             let res_sym = glob_ctx.add_variable();
@@ -359,6 +376,13 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
             let res_sym = glob_ctx.add_variable();
             add_code!(glob_ctx, "val {} = -{}", gen_sym(&res_sym), gen_sym(&sub_expr_sym));
             Ok(res_sym)
+        }
+
+        ExprKind::Let{ ref name, ref value, ref body } => {
+            let value_res_sym = gen_expr(value, glob_ctx, local_ctx)?;
+            let mut sub_local_ctx = local_ctx.clone();
+            sub_local_ctx.add_alias(name.clone(), &value_res_sym);
+            gen_expr(body, glob_ctx, &mut sub_local_ctx)
         }
 
         ExprKind::If { ref cond, ref on_true, ref on_false } => {
@@ -459,12 +483,13 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                         }
 
                         let (usage, ret) = compute_appender_usage(body, b_sym);
-                        if !ret {
+
+                        use self::AppenderUsage::*;
+                        if usage != Unsupported && !ret {
                             weld_err!("For loop body doesn't return builder: {}",
                                       print_expr(expr))?;
                         }
 
-                        use self::AppenderUsage::*;
                         match usage {
                             Once => gen_map_loop(&data_syms, elem_ty, body, &builder_sym,
                                                  b_sym, i_sym, e_sym, glob_ctx, local_ctx),
@@ -1099,24 +1124,47 @@ fn is_spatial_mutable(ty: &Type) -> bool {
 
 /// Returns appender usage, and true if expr returns the same appender.
 fn compute_appender_usage(expr: &TypedExpr, appender_sym: &Symbol) -> (AppenderUsage, bool) {
+    let mut aliases: HashSet<Symbol> = HashSet::new();
+    aliases.insert(appender_sym.clone());
+    _compute_appender_usage(expr, &mut aliases)
+}
+
+/// `aliases` is a set of aliases of the appender in question.
+fn _compute_appender_usage(expr: &TypedExpr, aliases: &mut HashSet<Symbol>)
+                          -> (AppenderUsage, bool) {
     match expr.kind {
         ExprKind::Literal(_) => (AppenderUsage::Unused, false),
 
-        ExprKind::Ident(ref sym) => (AppenderUsage::Unused, sym == appender_sym),
+        ExprKind::Ident(ref sym) => (AppenderUsage::Unused, aliases.contains(sym)),
+
+        ExprKind::Negate(ref expr) => {
+            let (expr_usage, expr_ret) = _compute_appender_usage(expr, aliases);
+            assert!(!expr_ret);  // Cannot negate an appender.
+            (expr_usage, false)
+        }
+
+        ExprKind::Let{ ref name, ref value, ref body } => {
+            let (value_usage, value_ret) = _compute_appender_usage(value, aliases);
+            let mut sub_aliases = aliases.clone();
+            // Both cases are important because `name` might shadow another identifier.
+            if value_ret { sub_aliases.insert(name.clone()) } else { sub_aliases.remove(name) };
+            let (body_usage, body_ret) = _compute_appender_usage(body, &mut sub_aliases);
+            (value_usage.compose_seq(body_usage), body_ret)
+        }
 
         ExprKind::BinOp { ref left, ref right, .. } => {
-            let (left_usage, left_ret) = compute_appender_usage(left, appender_sym);
-            let (right_usage, right_ret) = compute_appender_usage(right, appender_sym);
+            let (left_usage, left_ret) = _compute_appender_usage(left, aliases);
+            let (right_usage, right_ret) = _compute_appender_usage(right, aliases);
             assert!(!left_ret); // BinOp operands cannot be appenders.
             assert!(!right_ret);
             (left_usage.compose_seq(right_usage), false)
         }
 
         ExprKind::If { ref cond, ref on_true, ref on_false } => {
-            let (cond_usage, cond_ret) = compute_appender_usage(cond, appender_sym);
+            let (cond_usage, cond_ret) = _compute_appender_usage(cond, aliases);
             assert!(!cond_ret);  // A bool cannot be an appender.
-            let (true_usage, true_ret) = compute_appender_usage(on_true, appender_sym);
-            let (false_usage, false_ret) = compute_appender_usage(on_false, appender_sym);
+            let (true_usage, true_ret) = _compute_appender_usage(on_true, aliases);
+            let (false_usage, false_ret) = _compute_appender_usage(on_false, aliases);
             if true_ret != false_ret {
                 // Unsupported if only one branch returns the appender in question.
                 (AppenderUsage::Unsupported, false)
@@ -1127,7 +1175,7 @@ fn compute_appender_usage(expr: &TypedExpr, appender_sym: &Symbol) -> (AppenderU
 
         ExprKind::NewBuilder(ref opt) => {
             if let Some(ref e) = *opt {
-                let (usage, ret) = compute_appender_usage(e, appender_sym);
+                let (usage, ret) = _compute_appender_usage(e, aliases);
                 assert!(!ret);
                 (usage, false)
             } else {
@@ -1138,13 +1186,12 @@ fn compute_appender_usage(expr: &TypedExpr, appender_sym: &Symbol) -> (AppenderU
         ExprKind::For { ref iters, ref builder, ref func } => {
             let mut usage = AppenderUsage::Unused;
             for iter in iters {
-                let (iter_usage, iter_ret) = compute_appender_usage(iter.data.as_ref(),
-                                                                    appender_sym);
+                let (iter_usage, iter_ret) = _compute_appender_usage(iter.data.as_ref(), aliases);
                 assert!(!iter_ret);  // A vector cannot be an appender.
                 usage = usage.compose_seq(iter_usage)
             }
 
-            let (builder_usage, builder_ret) = compute_appender_usage(builder, appender_sym);
+            let (builder_usage, builder_ret) = _compute_appender_usage(builder, aliases);
             usage = usage.compose_seq(builder_usage);
             if builder_ret {  // For loop might merge into appender in question.
                 if let ExprKind::Lambda { ref params, ref body } = func.kind {
@@ -1166,8 +1213,8 @@ fn compute_appender_usage(expr: &TypedExpr, appender_sym: &Symbol) -> (AppenderU
         }
 
         ExprKind::Merge { ref builder, ref value } => {
-            let (builder_usage, builder_ret) = compute_appender_usage(builder, appender_sym);
-            let (value_usage, value_ret) = compute_appender_usage(value, appender_sym);
+            let (builder_usage, builder_ret) = _compute_appender_usage(builder, aliases);
+            let (value_usage, value_ret) = _compute_appender_usage(value, aliases);
             assert!(!value_ret);  // Assuming that one cannot merge an appender into a builder...
 
             let mut usage = builder_usage.compose_seq(value_usage);
@@ -1178,7 +1225,7 @@ fn compute_appender_usage(expr: &TypedExpr, appender_sym: &Symbol) -> (AppenderU
         }
 
         ExprKind::Res { ref builder } => {
-            let (builder_usage, builder_ret) = compute_appender_usage(builder, appender_sym);
+            let (builder_usage, builder_ret) = _compute_appender_usage(builder, aliases);
             if builder_ret {
                 // This probably shouldn't happen (taking result of appender)...
                 (AppenderUsage::Unsupported, false)
@@ -1188,7 +1235,7 @@ fn compute_appender_usage(expr: &TypedExpr, appender_sym: &Symbol) -> (AppenderU
         }
 
         ExprKind::GetField { expr: ref struct_expr, index } => {
-            let (builder_usage, builder_ret) = compute_appender_usage(&struct_expr, appender_sym);
+            let (builder_usage, builder_ret) = _compute_appender_usage(&struct_expr, aliases);
             assert!(!builder_ret); // A struct cannot be an appender...
 
             // FIXME(zhangwen): but the retrieved field might be the appender.
