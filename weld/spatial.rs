@@ -11,16 +11,22 @@ use super::util::SymbolGenerator;
 #[derive(Clone)]
 struct VectorInfo {
     len: Symbol, // Vector length.
-    len_bound: Symbol, // Static upper bound on vector length.
-    elem_ty: Type, // Element type.
+    len_bound: Symbol, // Static upper bound on vector length; used as Spatial DRAM size.
+    elem_ty: Type, // Element type; currently has to be scalar.
 }
 
 struct GlobalCtx {
     sym_gen: SymbolGenerator,
+
+    // A stack of CodeBuilders in use.  The last element is the "active" one; calling `add_code` on
+    // a GlobalCtx will add code to the active CodeBuilder.
     code_builders: Vec<CodeBuilder>,
-    vectors: HashMap<Symbol, VectorInfo>,
-    extra_host_init: CodeBuilder,
-    extra_accel_init: CodeBuilder,
+
+    vectors: HashMap<Symbol, VectorInfo>, // vector symbol => vector information
+    pub structs: HashMap<Symbol, Vec<Symbol>>, // symbol for struct value => components
+
+    extra_host_init: CodeBuilder,  // Extra init code to be added before Accel block
+    extra_accel_init: CodeBuilder, // Extra init code to be added at the start of Accel block
 }
 
 impl GlobalCtx {
@@ -30,31 +36,39 @@ impl GlobalCtx {
             sym_gen: SymbolGenerator::from_expression(weld_ast),
 
             vectors: HashMap::new(),
+            structs: HashMap::new(),
+
             extra_host_init: CodeBuilder::new(), // Before Accel block
             extra_accel_init: CodeBuilder::new(), // At the beginning of Accel block
         }
     }
 
+    /// Pushes a fresh code builder as the active one.
     pub fn enter_builder_scope(&mut self) {
         self.code_builders.push(CodeBuilder::new());
     }
 
+    /// Pops the current code builder and returns its contents.
     pub fn exit_builder_scope(&mut self) -> String {
         self.code_builders.pop().unwrap().result().to_string()
     }
 
+    /// Returns a globally unique Symbol.
     pub fn add_variable(&mut self) -> Symbol {
         self.sym_gen.new_symbol("tmp")
     }
 
+    /// Returns a vector of `count` globally unique Symbols.
     pub fn add_variables(&mut self, count: usize) -> Vec<Symbol> {
         (0..count).map(|_| self.add_variable()).collect()
     }
 
+    /// Adds code to the active CodeBuilder.
     pub fn add_code<S>(&mut self, code: S) where S: AsRef<str> {
         self.code_builders.last_mut().unwrap().add(code);
     }
 
+    /// Registers a vector with the global context.
     pub fn add_vec(&mut self, vec: &Symbol, len: &Symbol, len_bound: &Symbol, elem_ty: &Type) {
         self.vectors.insert(vec.clone(), VectorInfo {
             len: len.clone(), len_bound: len_bound.clone(), elem_ty: elem_ty.clone() });
@@ -107,19 +121,25 @@ impl GlobalCtx {
     }
 }
 
+/// Helper macro for adding code to global context.
 macro_rules! add_code {
     ( $glob_ctx:expr, $($arg:tt)* ) => ({
         $glob_ctx.add_code(format!($($arg)*))
     })
 }
 
+/// Helps generate code for merging into a vecmerger.
 #[derive(Clone)]
 struct VecMergerState<'a> {
-    sram_sym: &'a Symbol,
+    sram_sym: &'a Symbol, // SRAM to merge into (a block from destination vector)
+
+    // Starting index and extent of block.  A `merge(b, {i, e})` where `i` is outside this range
+    // should be ignored because it's not represented in the block.
     range_start_sym: &'a Symbol,
     range_size_sym: &'a Symbol,
 }
 
+/// If an appender has been used / how an appender is being used.
 #[derive(Clone, PartialEq)]
 enum AppenderState<'a> {
     Fresh, // Hasn't been used
@@ -131,18 +151,21 @@ enum AppenderState<'a> {
     Filter { fifo_sym: &'a Symbol },
 
     Dead, // Can no longer be used
+
     // For now there's no invalid state because an unsupported operation terminates compilation.
 }
 
+/// Characterizes the usage pattern for an appender in a piece of code.
 #[derive(Debug, PartialEq)]
 enum AppenderUsage {
-    Unused,
-    Once,
-    AtMostOnce,
-    Unsupported,
+    Unused, // The appender is not used.
+    Once, // The appdner is used exactly once.
+    AtMostOnce, // The appender is used <= once.
+    Unsupported, // Any other usage pattern.
 }
 
 impl AppenderUsage {
+    /// Computes appender usage for one piece of code followed by another (`self` then `other`).
     fn compose_seq(self, other: AppenderUsage) -> AppenderUsage {
         use self::AppenderUsage::*;
         match (self, other) {
@@ -151,6 +174,7 @@ impl AppenderUsage {
         }
     }
 
+    /// Computes appender usage for two pieces of code, exactly one of which is executed.
     fn compose_or(self, other: AppenderUsage) -> AppenderUsage {
         use self::AppenderUsage::*;
         match (self, other) {
@@ -167,7 +191,9 @@ impl AppenderUsage {
 struct LocalCtx<'a> {
     pub vecmergers: HashMap<Symbol, VecMergerState<'a>>,
     pub appenders: HashMap<Symbol, AppenderState<'a>>,
-    pub structs: HashMap<Symbol, Vec<Symbol>>, // symbol for struct value => components
+
+    // Maps a symbol to the symbol for which it's an alias.
+    // For example, within `let foo = bar; ...`, `foo` is mapped to `bar`.
     aliases: HashMap<Symbol, Symbol>,
 }
 
@@ -176,7 +202,6 @@ impl<'a> LocalCtx<'a> {
         LocalCtx {
             vecmergers: HashMap::new(),
             appenders: HashMap::new(),
-            structs: HashMap::new(),
             aliases: HashMap::new(),
         }
     }
@@ -188,15 +213,19 @@ impl<'a> LocalCtx<'a> {
         self.aliases.insert(alias, sym);
     }
 
+    /// Returns the symbol for which `alias` is an alias.
     pub fn resolve_alias(&self, alias: &Symbol) -> Symbol {
         (if let Some(sym) = self.aliases.get(alias) { sym } else { alias }).clone()
     }
 
+    /// Returns true if the two symbols are aliases of each other.
     pub fn are_alias(&self, sym1: &Symbol, sym2: &Symbol) -> bool {
         self.resolve_alias(sym1) == self.resolve_alias(sym2)
     }
 }
 
+/// Returns Spatial code, in text, generated from Weld AST, or error if a Weld usage pattern is not
+/// supported.  The Weld AST has to be a lambda.
 pub fn ast_to_spatial(expr: &TypedExpr) -> WeldResult<String> {
     if let ExprKind::Lambda { ref params, ref body } = expr.kind {
         let mut glob_ctx = GlobalCtx::new(expr);
@@ -253,6 +282,7 @@ pub fn ast_to_spatial(expr: &TypedExpr) -> WeldResult<String> {
     }
 }
 
+/// Returns the Scala type of a parameter representing a Weld value of type `ty`.
 fn gen_scala_param_type(ty: &Type) -> WeldResult<String> {
     match *ty {
         Type::Scalar(scalar_kind) => Ok(gen_scalar_type_from_kind(scalar_kind)),
@@ -269,6 +299,7 @@ fn gen_scala_param_type(ty: &Type) -> WeldResult<String> {
     }
 }
 
+/// Returns setup code for setting up Spatial parameters.
 fn gen_spatial_input_param_setup(param: &Parameter<Type>,
                                  scala_param_name: String,
                                  glob_ctx: &mut GlobalCtx)
@@ -302,6 +333,7 @@ fn gen_spatial_input_param_setup(param: &Parameter<Type>,
     }
 }
 
+/// Takes (result symbol, global context) and returns code as string.
 type CodeF = Box<Fn(&Symbol, &GlobalCtx) -> String>;
 
 /// Returns (prologue, body, epilogue).
@@ -333,6 +365,7 @@ fn gen_spatial_output_setup(ty: &Type) -> WeldResult<(String, CodeF, CodeF)> {
     }
 }
 
+/// Generates Scala type for Weld scalar kind.
 fn gen_scalar_type_from_kind(scalar_kind: ScalarKind) -> String {
     String::from(match scalar_kind {
         ScalarKind::Bool => "Boolean",
@@ -344,6 +377,8 @@ fn gen_scalar_type_from_kind(scalar_kind: ScalarKind) -> String {
     })
 }
 
+/// Generates Scala type for Weld scalar type.
+/// Returns WeldError with error message if `ty` is not a scalar type.
 fn gen_scalar_type(ty: &Type, err_msg: String) -> WeldResult<String> {
     match *ty {
         Type::Scalar(scalar_kind) => Ok(gen_scalar_type_from_kind(scalar_kind)),
@@ -351,6 +386,18 @@ fn gen_scalar_type(ty: &Type, err_msg: String) -> WeldResult<String> {
     }
 }
 
+/// Emits Spatial code for `expr` to the current CodeBuilder in `glob_ctx` and returns a Symbol for
+/// the result of `expr`.
+///
+/// The meaning of the returned Symbol depends on the type of `expr`:
+/// - If `expr` is a scalar or a merger, the Symbol names a Spatial value for the result of
+///   `expr`.  It can be a simple value (as in `val tmp_10 = 5`) or a Reg; this distinction
+///   shouldn't matter syntactically as the Spatial compiler adds register reads implicitly.
+/// - If `expr` is a vecmerger or an appender, the Symbol names the Spatial DRAM backing the
+///   builder.  The Symbol has been registered as a vector in `glob_ctx`.  Since the Spatial DRAM
+///   is declared outside the Accel block, it is accessible globally.
+/// - If `expr` is a struct, the Symbol uniquely identifies the struct and has no meaning in
+///   Spatial.  The Symbol has been registered as a struct in `glob_ctx`.
 fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx)
             -> WeldResult<Symbol> {
     match expr.kind {
@@ -378,7 +425,7 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
             Ok(res_sym)
         }
 
-        ExprKind::Let{ ref name, ref value, ref body } => {
+        ExprKind::Let { ref name, ref value, ref body } => {
             let value_res_sym = gen_expr(value, glob_ctx, local_ctx)?;
             let mut sub_local_ctx = local_ctx.clone();
             sub_local_ctx.add_alias(name.clone(), &value_res_sym);
@@ -398,8 +445,24 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
             let on_false_sym = gen_expr(on_false, glob_ctx, &mut false_local_ctx)?;
             let on_false_code = glob_ctx.exit_builder_scope();
 
-            if is_spatial_mutable(&expr.ty) {
+            if is_spatial_first_class(&expr.ty) {
+                // Mux the two values!
+                add_code!(glob_ctx, "{}", on_true_code);
+                add_code!(glob_ctx, "{}", on_false_code);
+
+                let res_sym = if on_true_sym == on_false_sym {
+                    on_true_sym.clone()
+                } else {
+                    let res_sym = glob_ctx.add_variable();
+                    add_code!(glob_ctx, "val {} = mux({}, {}, {})",
+                              gen_sym(&res_sym), gen_sym(&cond_sym),
+                              gen_sym(&on_true_sym), gen_sym(&on_false_sym));
+                    res_sym
+                };
+                Ok(res_sym)
+            } else {
                 if on_true_sym != on_false_sym {
+                    // E.g., a conditional over two different vectors is not allowed.
                     weld_err!("Not supported: if branches return different things {}",
                               print_expr(expr))
                 } else {
@@ -418,12 +481,6 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
 
                     Ok(on_true_sym)
                 }
-            } else {
-                // Mux the two values!
-                add_code!(glob_ctx, "{}", on_true_code);
-                add_code!(glob_ctx, "{}", on_false_code);
-                let res_sym = gen_mux(&cond_sym, &on_true_sym, &on_false_sym, glob_ctx);
-                Ok(res_sym)
             }
         }
 
@@ -432,6 +489,8 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
             if iters.is_empty() {
                 weld_err!("For without iters: {}", print_expr(expr))?
             }
+
+            // Evaluate the vectors to iterate over.
             let data_syms = iters.iter().map(|iter| {
                 if iter.start.is_some() || iter.end.is_some() || iter.stride.is_some() {
                     weld_err!("Not supported: iter with start, end, and/or stride")
@@ -549,9 +608,10 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
 
                     VecMerger(_, binop) =>
                         if let Some(vecmerger_state) = local_ctx.vecmergers.get(&builder_sym) {
-                            let values = local_ctx.structs.get(&value_res).unwrap();
-                            let ref index_sym = values[0];
-                            let ref merge_val_sym = values[1];
+                            let (index_sym, merge_val_sym) = {
+                                let values = glob_ctx.structs.get(&value_res).unwrap();
+                                (values[0].clone(), values[1].clone())
+                            };
 
                             // If the index is in range, merge the value.
                             let offset_sym = glob_ctx.add_variable();
@@ -564,12 +624,12 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                                 }}",
 
                                 offset = offset_sym_name,
-                                index = gen_sym(index_sym),
+                                index = gen_sym(&index_sym),
                                 start = gen_sym(&vecmerger_state.range_start_sym),
                                 range_size = gen_sym(&vecmerger_state.range_size_sym),
                                 sram = gen_sym(&vecmerger_state.sram_sym),
                                 binop = binop,
-                                value = gen_sym(merge_val_sym)
+                                value = gen_sym(&merge_val_sym)
                             );
                             Ok(builder_sym)
                         } else {
@@ -581,6 +641,8 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                         let appender_state = local_ctx.appenders.get(&builder_sym).unwrap();
                         match *appender_state {
                             Map { ref sram_sym, ref ii_sym } => {
+                                // In a "map" operation, a "merge" is just an assignment (to the
+                                // same offset).
                                 add_code!(glob_ctx, "{sram}({ii}) = {value}",
                                           sram = gen_sym(&sram_sym),
                                           ii = gen_sym(&ii_sym),
@@ -589,6 +651,8 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                             }
 
                             Filter { ref fifo_sym } => {
+                                // In a "filter" operation, a "merge" (hopefully surrounded by a
+                                // conditional) entails pushing an element into a local queue.
                                 add_code!(glob_ctx, "{fifo}.enq({value})",
                                           fifo = gen_sym(&fifo_sym),
                                           value = gen_sym(&value_res));
@@ -626,13 +690,13 @@ fn gen_expr(expr: &TypedExpr, glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx
                      .collect::<WeldResult<Vec<Symbol>>>()?;
 
             let struct_sym = glob_ctx.add_variable(); // Just an identifier for the struct.
-            local_ctx.structs.insert(struct_sym.clone(), res_syms);
+            glob_ctx.structs.insert(struct_sym.clone(), res_syms);
             Ok(struct_sym)
         }
 
         ExprKind::GetField { expr: ref struct_expr, index } => {
             let expr_res = gen_expr(&struct_expr, glob_ctx, local_ctx)?;
-            if let Some(components) = local_ctx.structs.get(&expr_res) {
+            if let Some(components) = glob_ctx.structs.get(&expr_res) {
                 if let Some(component_sym) = components.get(index as usize) {
                     Ok(component_sym.clone())
                 } else {
@@ -673,8 +737,7 @@ fn gen_load_arr_blocks(data_syms: &Vec<Symbol>, blk: usize, start: &str, extent:
 }
 
 /// Declares the `e` parameter for loop body.
-fn gen_loop_e(e_sym: &Symbol, block_syms: &Vec<Symbol>, loop_var: &str, glob_ctx: &mut GlobalCtx,
-              local_ctx: &mut LocalCtx) {
+fn gen_loop_e(e_sym: &Symbol, block_syms: &Vec<Symbol>, loop_var: &str, glob_ctx: &mut GlobalCtx) {
     assert!(!block_syms.is_empty());
     if block_syms.len() == 1 { // `e` is just an element.
         add_code!(glob_ctx, "val {} = {}({})", gen_sym(&e_sym), gen_sym(&block_syms[0]), loop_var);
@@ -684,10 +747,20 @@ fn gen_loop_e(e_sym: &Symbol, block_syms: &Vec<Symbol>, loop_var: &str, glob_ctx
             add_code!(glob_ctx, "val {} = {}({})", gen_sym(&component_sym), gen_sym(&block_sym),
                       loop_var);
         }
-        local_ctx.structs.insert(e_sym.clone(), component_syms);
+        glob_ctx.structs.insert(e_sym.clone(), component_syms);
     }
 }
 
+/// Codegen: "for" loop over `data_syms` with vecmerger with `binop` into vector `dst_sym`.
+///
+/// A for loop with a vecmerger may involve random access to a Weld vector (`dst_sym`), which is
+/// backed by a Spatial DRAM.  However, a DRAM element has to be brought into an SRAM before being
+/// accessed.  We therefore break the DRAM into chunks and execute the loop body for each chunk;
+/// a merge is carried out iff it's into an element within the current chunk.  Although this
+/// approach may require making multiple passes over `data_syms`, the destination DRAM is hopefully
+/// small enough to fit into an SRAM so that only one pass is needed.
+///
+/// See the diagram in the function body for the implementation of a pass.
 fn gen_vecmerger_loop(data_syms: &Vec<Symbol>, dst_ty: &Type, body: &TypedExpr,
                       dst_sym: &Symbol, binop: BinOpKind,
                       b_sym: &Symbol, i_sym: &Symbol, e_sym: &Symbol,
@@ -719,7 +792,7 @@ fn gen_vecmerger_loop(data_syms: &Vec<Symbol>, dst_ty: &Type, body: &TypedExpr,
 
     // Initialize `e`.
     glob_ctx.enter_builder_scope();
-    gen_loop_e(e_sym, &block_syms, "ii", glob_ctx, &mut sub_local_ctx);
+    gen_loop_e(e_sym, &block_syms, "ii", glob_ctx);
     let init_e_code = glob_ctx.exit_builder_scope();
 
     sub_local_ctx.vecmergers.insert(b_sym.clone(),
@@ -801,6 +874,11 @@ fn gen_vecmerger_loop(data_syms: &Vec<Symbol>, dst_ty: &Type, body: &TypedExpr,
     Ok(dst_sym.clone())
 }
 
+/// Codegen: "for" loop over `data_syms` with merger `merger_sym` with `binop`.
+///
+/// Such a loop is simply translated to nested Reduces in Spatial.  The result of the Reduce gets
+/// folded into the merger's initial value and stored in a new variable (representing the current
+/// value of the merger).  A symbol for this variable is returned.
 fn gen_merger_loop(data_syms: &Vec<Symbol>, merger_elem_ty: &Type, body: &TypedExpr,
                    merger_sym: &Symbol, binop: BinOpKind,
                    b_sym: &Symbol, i_sym: &Symbol, e_sym: &Symbol,
@@ -833,7 +911,7 @@ fn gen_merger_loop(data_syms: &Vec<Symbol>, merger_elem_ty: &Type, body: &TypedE
 
     // Prepare to generate code for body.
     let mut sub_local_ctx = local_ctx.clone();
-    gen_loop_e(&e_sym, &block_syms, "ii", glob_ctx, &mut sub_local_ctx);
+    gen_loop_e(&e_sym, &block_syms, "ii", glob_ctx);
     // Create new merger for `b`; all local merges are gathered into it.
     gen_new_merger(merger_elem_ty, glob_ctx, Some(b_sym))?;
     let body_res = gen_expr(body, glob_ctx, &mut sub_local_ctx)?;
@@ -850,6 +928,12 @@ fn gen_merger_loop(data_syms: &Vec<Symbol>, merger_elem_ty: &Type, body: &TypedE
     Ok(reduce_res)
 }
 
+/// Codegen: "for" loop over `data_syms` with appender `appender_sym` that performs a "map".
+///
+/// This case is simple: Create a result vector of the correct size, go through `data_syms`, and
+/// make each "merge" write to the corresponding position in the result vector block currently in
+/// SRAM.  "merge" into `b_sym` will behave like this inside the loop body after `b_sym` is
+/// registered as an "map" appender in the local context.
 fn gen_map_loop(data_syms: &Vec<Symbol>, elem_ty: &Type, body: &TypedExpr,
                 appender_sym: &Symbol, b_sym: &Symbol, i_sym: &Symbol, e_sym: &Symbol,
                 glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx) -> WeldResult<Symbol> {
@@ -871,7 +955,7 @@ fn gen_map_loop(data_syms: &Vec<Symbol>, elem_ty: &Type, body: &TypedExpr,
 
     // Initialize `e`.
     glob_ctx.enter_builder_scope();
-    gen_loop_e(e_sym, &block_syms, gen_sym(&ii_sym).as_str(), glob_ctx, &mut sub_local_ctx);
+    gen_loop_e(e_sym, &block_syms, gen_sym(&ii_sym).as_str(), glob_ctx);
     let init_e_code = glob_ctx.exit_builder_scope();
 
     sub_local_ctx.appenders.insert(
@@ -913,6 +997,18 @@ fn gen_map_loop(data_syms: &Vec<Symbol>, elem_ty: &Type, body: &TypedExpr,
     Ok(appender_sym.clone())
 }
 
+/// Codegen: "for" loop over `data_syms` with appender `appender_sym` that performs a "filter".
+///
+/// The input vectors are processed in "superblocks" of `PAR` "blocks" of size `BLK_SIZE`.  For
+/// each superblock:
+///  - For each block (in parallel), evaluate the loop body over each element; a "merge" pushes the
+///    result into a FIFO local to the block;
+///  - Sequentially compute the starting index of each FIFO in the destination vector (prefix sum);
+///  - For each block (in parallel), store its FIFO's contents to the start index in the
+///    destination vector.
+///
+/// The loops are unrolled for parallelism.  We don't use Spatial's "par" feature because it's hard
+/// to create and refer to the FIFOs across loops.
 fn gen_filter_loop(data_syms: &Vec<Symbol>, appender_elem_ty: &Type, body: &TypedExpr,
                    appender_sym: &Symbol, b_sym: &Symbol, i_sym: &Symbol, e_sym: &Symbol,
                    glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx) -> WeldResult<Symbol> {
@@ -959,7 +1055,7 @@ fn gen_filter_loop(data_syms: &Vec<Symbol>, appender_elem_ty: &Type, body: &Type
 
         // Initialize `e`.
         glob_ctx.enter_builder_scope();
-        gen_loop_e(e_sym, &block_syms, "ii", glob_ctx, &mut sub_local_ctx);
+        gen_loop_e(e_sym, &block_syms, "ii", glob_ctx);
         let init_e_code = glob_ctx.exit_builder_scope();
 
         sub_local_ctx.appenders.insert(
@@ -1031,6 +1127,10 @@ fn gen_filter_loop(data_syms: &Vec<Symbol>, appender_elem_ty: &Type, body: &Type
     Ok(appender_sym.clone())
 }
 
+/// Codegen: create new vecmerger into vector `vec_sym`.
+///
+/// Creates a new vector and copies the entire `vec_sym` over, so that merges into this vecmerger
+/// are on top of the initial values in `vec_sym`.
 fn gen_new_vecmerger(vec_sym: &Symbol, elem_ty: &Type, glob_ctx: &mut GlobalCtx)
                      -> WeldResult<Symbol> {
     let elem_type_scala = gen_scalar_type(elem_ty, format!("Not supported vecmerger type: {}",
@@ -1056,6 +1156,10 @@ fn gen_new_vecmerger(vec_sym: &Symbol, elem_ty: &Type, glob_ctx: &mut GlobalCtx)
     Ok(vecmerger_sym)
 }
 
+/// Codegen: create new appender.
+///
+/// Doesn't actually generate any code, because the code depends on the appender's use pattern (map
+/// vs. filter), which is computed later.
 fn gen_new_appender(glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx) -> WeldResult<Symbol> {
     let appender_sym = glob_ctx.add_variable();
     // Don't declare underlying DRAM yet.
@@ -1063,6 +1167,10 @@ fn gen_new_appender(glob_ctx: &mut GlobalCtx, local_ctx: &mut LocalCtx) -> WeldR
     Ok(appender_sym)
 }
 
+/// Codegen: create new merger with specified name if `merger_sym` is Some; uses new sym otherwise.
+///
+/// Just creates a Scala value that is the identity for the reduction operator.  This value is
+/// immutable; a `merge` into a merger is represented by a new symbol containing the updated value.
 fn gen_new_merger(elem_ty: &Type, glob_ctx: &mut GlobalCtx,
                   merger_sym: Option<&Symbol>) -> WeldResult<Symbol> {
     let elem_type_scala = gen_scalar_type(elem_ty, format!("Not supported merger type: {}",
@@ -1074,56 +1182,50 @@ fn gen_new_merger(elem_ty: &Type, glob_ctx: &mut GlobalCtx,
     Ok(init_sym)
 }
 
-/// Returns a symbol whose value is `cond_sym ? on_true_sym : on_false_sym`.
-fn gen_mux(cond_sym: &Symbol, on_true_sym: &Symbol, on_false_sym: &Symbol,
-           glob_ctx: &mut GlobalCtx) -> Symbol {
-    if on_true_sym == on_false_sym {  // No need for mux (since no side effects).
-        on_true_sym.clone()
-    } else {
-        let res_sym = glob_ctx.add_variable();
-        add_code!(glob_ctx, "val {} = mux({}, {}, {})",
-                  gen_sym(&res_sym), gen_sym(&cond_sym),
-                  gen_sym(&on_true_sym), gen_sym(&on_false_sym));
-        res_sym
-    }
-}
-
+/// Generates Scala representation of literals.
 fn gen_lit(lit: LiteralKind) -> String {
     let (val_str, type_str) = match lit {
         LiteralKind::BoolLiteral(b) => (b.to_string(), "Boolean"),
         LiteralKind::I8Literal(i) => (i.to_string(), "Char"),
         LiteralKind::I32Literal(i) => (i.to_string(), "Int"),
         LiteralKind::I64Literal(i) => (i.to_string(), "Long"),
-        LiteralKind::F32Literal(f) => (f.to_string(), "Float"),  // TODO(zhangwen): this works?
+        LiteralKind::F32Literal(f) => (f.to_string(), "Float"),
         LiteralKind::F64Literal(f) => (f.to_string(), "Double"),
     };
     format!("{}.to[{}]", val_str, type_str)
 }
 
+/// Generates Spatial name for symbol.
 fn gen_sym(sym: &Symbol) -> String {
     format!("{}_{}", sym.name, sym.id)
 }
 
-/// Returns true if a Spatial variable for a Weld value of type `ty` is mutable, e.g. for
-/// vecmerger.
-/// FIXME(zhangwen): write better documentation.
-fn is_spatial_mutable(ty: &Type) -> bool {
+/// Returns true if a value of Weld type `ty` is a "first-class" value in Spatial.
+///
+/// For example, a literal or a merger is a "first-class" value in Spatial, but a vector is not.
+/// This function currently assists code generation for conditionals: for "first-class" values,
+/// emit a mux; otherwise, emit an "if" block.
+///
+/// FIXME(zhangwen): Currently doesn't allow Weld conditionals over different structs.  Can make
+/// struct "first-class" if all of its element types are "first-class" and emit one mux for each
+/// element (or more, for nested structs).
+fn is_spatial_first_class(ty: &Type) -> bool {
     use ast::Type::*;
     match *ty {
-        Scalar(_) => false,
+        Scalar(_) => true,
         Builder(ref kind, _) => {
             use ast::BuilderKind::*;
             match *kind {
-                Appender(_) | DictMerger(_, _, _) | VecMerger(_, _) => true,
-                GroupMerger(_, _) => true, // FIXME(zhangwen): what's a GroupMerger?
-                Merger(_, _) => false,
+                Appender(_) | DictMerger(_, _, _) | VecMerger(_, _) => false,
+                GroupMerger(_, _) => false,
+                Merger(_, _) => true,
             }
         }
-        _ => true,
+        _ => false,
     }
 }
 
-/// Returns appender usage, and true if expr returns the same appender.
+/// Returns appender usage, and true if expr returns an appender derived from `appender_sym`.
 fn compute_appender_usage(expr: &TypedExpr, appender_sym: &Symbol) -> (AppenderUsage, bool) {
     let mut aliases: HashSet<Symbol> = HashSet::new();
     aliases.insert(appender_sym.clone());
